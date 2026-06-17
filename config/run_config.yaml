@@ -1,0 +1,18 @@
+project_root: D:/codeenv/pycharmproject/National_RL/Power_curve_V2
+output_root: outputs
+report_root: reports
+start_year: 2020
+end_year: 2024
+weather_root: D:/National_model/Data/ERA5/original_data
+era5_time_policy: strict_utc_to_bj
+weather_parallel_workers: 6
+author_load_workbook: 2015_2024各省负荷_论文/Data output.xlsx
+power_coefficient_workbook: 各省冷热系数/Power coefficient.xlsx
+spring_bias_workbook: 春节月份分省用电偏差分析_2010-2020.xlsx
+city_weight_workbook: 城市月度省内用电占比_2022.xlsx
+ev_stock_workbook: 新能源汽车保有量/17-23年新能源汽车保有量.xlsx
+actual_hainan_workbook: 实际统调负荷_海南广东/2020-2024海南统调负荷.xls
+actual_guangdong_workbook: 实际统调负荷_海南广东/20200101-20241231广东省负荷_t.xlsx
+actual_guangdong_legacy_csv: 实际统调负荷_海南广东/广东省负荷(2018-2023).csv
+province_shapefile: 省级矢量边界/中国_省_市_县shp格式/中国_省.shp
+city_shapefile: 省级矢量边界/中国_省_市_县shp格式/中国_市级行政区.shp

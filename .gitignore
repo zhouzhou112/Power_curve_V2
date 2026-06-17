@@ -1,0 +1,57 @@
+# Runtime outputs
+/*/
+!/config/
+!/scripts/
+outputs/
+reports/
+figures/
+logs/
+
+# Python caches and local tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.venv/
+venv/
+env/
+
+# Raw data and heavy geospatial/weather files
+*.xlsx
+*.xls
+*.xlsm
+*.csv
+*.csv.gz
+*.tsv
+*.nc
+*.nc4
+*.grib
+*.grib2
+*.tif
+*.tiff
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.sbn
+*.sbx
+*.geojson
+*.gpkg
+
+# Local path notes and IDE files
+*.log
+*.tmp
+*.bak
+*.txt
+.idea/
+.vscode/
+
+# Keep source/config/plans reviewable even under broad data ignores
+!config/
+!config/*.yaml
+!scripts/
+!scripts/*.py
+!*.md
