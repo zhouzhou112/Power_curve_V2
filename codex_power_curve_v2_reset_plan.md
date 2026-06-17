@@ -651,6 +651,16 @@ era5_2019_boundary_fallback_method: next_day_same_local_hour
 
 仅当上述两个检查均无 `HARD_FAIL` 时，才允许运行全国 2020—2024 完整 Module 02。
 
+Module 02 ERA5 读取按目标年月分块，每个月内对 ERA5 变量使用
+`ProcessPoolExecutor` 并行抽取。默认配置为 `weather_parallel_workers: 2`，
+并由 `weather_parallel_max_workers: 4` 设定内存保护上限；也可用
+`--weather-workers N` 临时覆盖。QC 文件 `qc_flags_module02.csv` 中必须记录
+`configured_workers`、`max_workers`、`active_workers` 和 `active_mode`。完整运行命令为：
+
+```powershell
+& "C:\Users\ZZ\.conda\envs\RL\python.exe" -X utf8 scripts\02_reconstruct_weather_and_thermal_load.py --weather-workers 2
+```
+
 ### 7.6 Power coefficients
 
 从 `各省冷热系数/` 读取论文拟合好的逐省逐年系数。

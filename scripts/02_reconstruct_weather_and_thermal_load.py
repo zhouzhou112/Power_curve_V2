@@ -5,6 +5,7 @@ import argparse
 import gc
 import os
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -86,6 +87,12 @@ def parse_module_args() -> argparse.Namespace:
     parser.add_argument("--smoke-year", type=int, default=None, help="Optional target Beijing year for smoke extraction")
     parser.add_argument("--smoke-month", type=int, default=None, help="Optional target Beijing month for smoke extraction")
     parser.add_argument("--smoke-variable", choices=sorted(ERA5_SPECS), default=None, help="Optional single ERA5 variable smoke test")
+    parser.add_argument(
+        "--weather-workers",
+        type=int,
+        default=None,
+        help="Override config weather_parallel_workers for month-variable ERA5 extraction",
+    )
     return parser.parse_args()
 
 
@@ -868,6 +875,54 @@ def merge_month_variable_frames(var_frames: list[pd.DataFrame]) -> pd.DataFrame:
     return base
 
 
+def resolve_weather_workers(ctx, args: argparse.Namespace, variables: list[str]) -> tuple[int, int, int, str]:
+    configured_workers = args.weather_workers
+    if configured_workers is None:
+        configured_workers = int(ctx.config.get("weather_parallel_workers", 2))
+    configured_workers = max(1, int(configured_workers))
+    max_workers = max(1, int(ctx.config.get("weather_parallel_max_workers", 4)))
+    active_workers = min(configured_workers, max_workers, len(variables))
+    if len(variables) <= 1:
+        active_workers = 1
+    active_mode = "process_pool_variable_parallel" if active_workers > 1 else "sequential_streaming"
+    return configured_workers, max_workers, active_workers, active_mode
+
+
+def extract_month_variables(
+    ctx,
+    target_year: int,
+    target_month: int,
+    variables: list[str],
+    month_times: pd.DataFrame,
+    month_weights: pd.DataFrame,
+    active_workers: int,
+    extraction_qc: list[dict[str, Any]],
+) -> list[pd.DataFrame]:
+    if active_workers <= 1 or len(variables) <= 1:
+        var_frames: list[pd.DataFrame] = []
+        for var in variables:
+            frame, qc_rows = extract_month_variable(ctx, target_year, target_month, var, month_times, month_weights)
+            var_frames.append(frame)
+            extraction_qc.extend(qc_rows)
+            write_df(pd.DataFrame(extraction_qc), ctx.tables_dir / "weather_extraction_qc.csv")
+        return var_frames
+
+    completed: dict[str, pd.DataFrame] = {}
+    with ProcessPoolExecutor(max_workers=active_workers) as executor:
+        futures = {
+            executor.submit(extract_month_variable, ctx, target_year, target_month, var, month_times, month_weights): var
+            for var in variables
+        }
+        for future in as_completed(futures):
+            var = futures[future]
+            frame, qc_rows = future.result()
+            completed[var] = frame
+            extraction_qc.extend(qc_rows)
+            write_df(pd.DataFrame(extraction_qc), ctx.tables_dir / "weather_extraction_qc.csv")
+            print(f"[module02] completed parallel variable {var} for {target_year}-{target_month:02d}", flush=True)
+    return [completed[var] for var in variables]
+
+
 def build_weather(ctx, point_weights: pd.DataFrame, flags: list[dict], args: argparse.Namespace) -> None:
     smoke_year = args.smoke_year
     smoke_month = args.smoke_month
@@ -892,15 +947,19 @@ def build_weather(ctx, point_weights: pd.DataFrame, flags: list[dict], args: arg
     if not args.smoke_variable:
         write_method_report(ctx)
         thresholds = build_hdd_cdd_thresholds(ctx, flags)
-    max_workers = int(ctx.config.get("weather_parallel_workers", 1))
-    capped_workers = max(1, min(max_workers, 2))
+    configured_workers, max_workers, active_workers, active_mode = resolve_weather_workers(ctx, args, variables)
     add_qc(
         flags,
         MODULE,
         "INFO",
         "weather_reader_parallel_policy",
-        "ERA5 读取按 year-month-variable 流式执行；默认单 worker，最多 2",
-        {"configured_workers": max_workers, "capped_workers": capped_workers, "active_mode": "sequential_streaming"},
+        "ERA5 extraction runs by target month with configurable per-variable process parallelism",
+        {
+            "configured_workers": configured_workers,
+            "max_workers": max_workers,
+            "active_workers": active_workers,
+            "active_mode": active_mode,
+        },
     )
 
     tmp_dir = ctx.run_dir / "tmp_module02_weather"
@@ -913,12 +972,16 @@ def build_weather(ctx, point_weights: pd.DataFrame, flags: list[dict], args: arg
         if month_weights.empty:
             add_qc(flags, MODULE, "HARD_FAIL", "month_point_weights_missing", "指定月份缺少 ERA5 点权重", {"month": int(target_month)})
             return
-        var_frames: list[pd.DataFrame] = []
-        for var in variables:
-            frame, qc_rows = extract_month_variable(ctx, int(target_year), int(target_month), var, month_times, month_weights)
-            var_frames.append(frame)
-            extraction_qc.extend(qc_rows)
-            write_df(pd.DataFrame(extraction_qc), ctx.tables_dir / "weather_extraction_qc.csv")
+        var_frames = extract_month_variables(
+            ctx,
+            int(target_year),
+            int(target_month),
+            variables,
+            month_times,
+            month_weights,
+            active_workers,
+            extraction_qc,
+        )
         month_weather = merge_month_variable_frames(var_frames)
         month_weather["target_year"] = int(target_year)
         month_weather["target_month"] = int(target_month)

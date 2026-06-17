@@ -43,9 +43,12 @@ Province-month final point weights must close to 1.
 ERA5 extraction uses only `lat_idx/lon_idx` from
 `era5_grid_point_weights_by_month.csv`. It processes each target
 year-month-variable chunk separately and writes month-level temporary exposure
-files before assembling the final 2020-2024 table. The default local reader is
-single-worker, with an upper cap of 2 workers if parallelism is explicitly
-enabled later.
+files before assembling the final 2020-2024 table. Within each target month,
+ERA5 variables are extracted with configurable process parallelism. The default
+is `weather_parallel_workers: 2`, with `weather_parallel_max_workers: 4` as the
+memory-safety cap; `--weather-workers N` can override the configured value for a
+specific run. `qc_flags_module02.csv` records configured, maximum, active worker
+counts and the active execution mode.
 
 ## BAIT
 
