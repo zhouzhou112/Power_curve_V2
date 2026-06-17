@@ -54,6 +54,7 @@ Implemented files:
 - `scripts/05_actual_load_validation_gd_hainan.py`
 - `scripts/06_figures_and_reports.py`
 - `codex_power_curve_v2_reset_plan.md`
+- `MODULE02_CITY_ERA5_BAIT_REVISION.md`
 
 Latest local syntax check:
 
@@ -73,16 +74,22 @@ Result: `syntax ok 9`.
   by city polygons, assigns each city's monthly electricity weight to its covered
   ERA5 points, then normalizes to province-month weights for hourly feature
   extraction.
-- Module 02 uses `ThreadPoolExecutor` rather than `ProcessPoolExecutor` because
-  this Windows sandbox rejected multiprocessing pipe creation with
-  `PermissionError: [WinError 5]`.
+- Module 02 now uses a two-stage flow: first write city/ERA5 mapping and
+  province-month point weights, then stream ERA5 by target year-month-variable.
+  It no longer holds all 5 years x 6 variables in a `results` dictionary.
+- Module 02 defaults to single-worker ERA5 reading, capped at 2 if parallel
+  reading is enabled later. This avoids local Windows NetCDF I/O contention.
 - Strict UTC-to-Beijing alignment ideally requires 2019 year-end ERA5 files for
   the first eight Beijing-time hours of 2020. The current implementation records
   a `WARN` and applies an explicit eight-hour boundary fallback to 2020 ERA5
   hours if those 2019 files are absent.
-- BAIT is implemented as a transparent approximation because exact fitted paper
-  coefficients were not available in the local inputs. This should be reviewed
-  before using the decomposition for paper claims.
+- BAIT is now implemented from the specified Eq.(4)-Eq.(11) structure, including
+  specific humidity from dewpoint plus surface pressure and a finite 48-hour
+  exponential window. The older transparent approximation is no longer used as
+  the main result.
+- Local smoke tests passed for Module 02: `--only-weights`,
+  `--smoke-province 广东 --smoke-year 2020 --smoke-month 1 --smoke-variable t2m`,
+  and `--smoke-province 广东 --smoke-year 2020 --smoke-month 1`.
 
 ## Review Priorities
 

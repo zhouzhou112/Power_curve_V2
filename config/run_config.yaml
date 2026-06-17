@@ -5,7 +5,7 @@ start_year: 2020
 end_year: 2024
 weather_root: D:/National_model/Data/ERA5/original_data
 era5_time_policy: strict_utc_to_bj
-weather_parallel_workers: 6
+weather_parallel_workers: 1
 author_load_workbook: 2015_2024各省负荷_论文/Data output.xlsx
 power_coefficient_workbook: 各省冷热系数/Power coefficient.xlsx
 spring_bias_workbook: 春节月份分省用电偏差分析_2010-2020.xlsx

@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import json
+import argparse
+import gc
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -12,16 +14,15 @@ import pandas as pd
 from power_curve_common import (
     NORTH_PROVINCES,
     YEARS,
+    PROJECT_ROOT,
     add_qc,
     get_input_paths,
     init_context,
     module_exit,
     normalize_city,
     normalize_province,
-    parse_args,
     read_power_coefficients,
     read_required_table,
-    rel,
     write_df,
     write_markdown,
 )
@@ -29,270 +30,411 @@ from power_curve_common import (
 
 MODULE = "02_reconstruct_weather_and_thermal_load"
 
-ERA5_PATTERNS = {
-    "t2m": ("2m_temp", "t2m_{year}.nc"),
-    "d2m": ("2m_dewpoint", "dt2m_{year}.nc"),
-    "u10": ("10mu", "u_{year}.nc"),
-    "v10": ("10mv", "v_{year}.nc"),
-    "ssrd": ("surface_solar_radi", "ssrd_{year}.nc"),
-    "sp": ("surface_press", "sp_{year}.nc"),
+ERA5_SPECS: dict[str, dict[str, str]] = {
+    "t2m": {"folder": "2m_temp", "pattern": "t2m_{year}.nc", "output": "temperature_c", "unit_transform": "kelvin_to_c"},
+    "d2m": {"folder": "2m_dewpoint", "pattern": "dt2m_{year}.nc", "output": "dewpoint_c", "unit_transform": "kelvin_to_c"},
+    "u10": {"folder": "10mu", "pattern": "u_{year}.nc", "output": "u10_ms", "unit_transform": "none"},
+    "v10": {"folder": "10mv", "pattern": "v_{year}.nc", "output": "v10_ms", "unit_transform": "none"},
+    "ssrd": {"folder": "surface_solar_radi", "pattern": "ssrd_{year}.nc", "output": "solar_wm2", "unit_transform": "j_m2_to_w_m2"},
+    "sp": {"folder": "surface_press", "pattern": "sp_{year}.nc", "output": "surface_pressure_pa", "unit_transform": "none"},
 }
 
+BAIT_PARAMS = {
+    "x": 0.012,
+    "y": 0.2,
+    "z": 0.05,
+    "t_star_c": 16.0,
+    "smooth_lambda": 0.10232,
+    "smooth_window_hours": 48,
+    "blend_lower_c": 15.0,
+    "blend_upper_c": 23.0,
+}
 
-def _extract_era5_province_task(task: dict) -> tuple[pd.DataFrame, dict]:
-    """Worker: extract one variable-year file and aggregate ERA5 grid points to province-hour."""
-    import xarray as xr
+REQUIRED_WEATHER_COLS = ["temperature_c", "dewpoint_c", "u10_ms", "v10_ms", "solar_wm2", "surface_pressure_pa"]
 
-    var = task["var"]
-    ds_path = task["ds_path"]
-    year_times = pd.DataFrame(task["year_times"])
-    point_weights = pd.DataFrame(task["point_weights"])
-    source_year = int(task["source_year"])
-    unit_transform = task["unit_transform"]
 
-    ds = xr.open_dataset(ds_path)
+def parse_module_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Module 02: city-weighted ERA5 exposure and BAIT/HDD/CDD reconstruction")
+    parser.add_argument("--run-dir", type=str, default=None)
+    parser.add_argument("--config", type=str, default=str(PROJECT_ROOT / "config" / "run_config.yaml"))
+    parser.add_argument("--only-weights", action="store_true", help="Build city-ERA5 mapping and point weights only")
+    parser.add_argument("--smoke-province", type=str, default=None, help="Optional single province for smoke extraction")
+    parser.add_argument("--smoke-year", type=int, default=None, help="Optional target Beijing year for smoke extraction")
+    parser.add_argument("--smoke-month", type=int, default=None, help="Optional target Beijing month for smoke extraction")
+    parser.add_argument("--smoke-variable", choices=sorted(ERA5_SPECS), default=None, help="Optional single ERA5 variable smoke test")
+    return parser.parse_args()
+
+
+def current_memory_mb() -> float | None:
     try:
-        unique_points = (
-            point_weights[["lat_idx", "lon_idx"]]
-            .drop_duplicates()
-            .sort_values(["lat_idx", "lon_idx"])
-            .reset_index(drop=True)
-        )
-        unique_points["point_id"] = np.arange(len(unique_points))
-        point_weights = point_weights.merge(unique_points, on=["lat_idx", "lon_idx"], how="left")
-        da = ds[var].isel(
-            latitude=xr.DataArray(unique_points["lat_idx"].astype(int).to_numpy(), dims="point"),
-            longitude=xr.DataArray(unique_points["lon_idx"].astype(int).to_numpy(), dims="point"),
-        )
-        time_index = pd.DatetimeIndex(pd.to_datetime(ds["valid_time"].values))
-        source_dt = pd.to_datetime(year_times["source_datetime"])
-        indexer = time_index.get_indexer(source_dt)
-        if (indexer < 0).any():
-            missing_times = year_times.loc[indexer < 0, ["datetime_bj", "source_datetime"]].head(20).astype(str).to_dict("records")
-            raise ValueError(f"ERA5 time coverage missing for {var} {source_year}: {missing_times}")
-        year_times = year_times.reset_index(drop=True)
-        year_times["time_indexer"] = indexer
-        result_parts: list[pd.DataFrame] = []
-        for month, time_sub in year_times.groupby("month", sort=True):
-            month_indexer = time_sub["time_indexer"].to_numpy(dtype=int)
-            values = np.asarray(da.isel(valid_time=xr.DataArray(month_indexer, dims="time")).load().values, dtype=np.float32)
-            if unit_transform == "kelvin_to_c":
-                values = values - np.float32(273.15)
-            elif unit_transform == "j_m2_to_w_m2":
-                values = values / np.float32(3600.0)
-            weights_month = point_weights[point_weights["month"].astype(int).eq(int(month))]
-            for province, weights_p in weights_month.groupby("province_cn", sort=True):
-                point_ids = weights_p["point_id"].astype(int).to_numpy()
-                weights = weights_p["point_weight"].to_numpy(dtype=np.float32)
-                weights = weights / weights.sum()
-                result_parts.append(
-                    pd.DataFrame(
-                        {
-                            "province_cn": province,
-                            "datetime_bj": time_sub["datetime_bj"].to_numpy(),
-                            "time_alignment_method": time_sub["time_alignment_method"].to_numpy(),
-                            var: values[:, point_ids].dot(weights).astype(np.float32),
-                        }
-                    )
-                )
-            del values
-    finally:
-        ds.close()
-    out = pd.concat(result_parts, ignore_index=True)
-    qc = {
-        "source_year": source_year,
-        "variable": var,
-        "target_rows": int(len(year_times)),
-        "unique_grid_points": int(len(unique_points)),
-        "aggregated_rows": int(len(out)),
-        "file": ds_path,
-    }
-    return out, qc
+        import psutil  # type: ignore
 
-
-def required_era5_files(weather_root: Path) -> tuple[list[Path], list[Path]]:
-    required: list[Path] = []
-    missing: list[Path] = []
-    # Strict BJ target -> UTC source requires 2019-2024 for the first eight BJ hours of 2020.
-    for year in range(2019, 2025):
-        for folder, pattern in ERA5_PATTERNS.values():
-            path = weather_root / folder / pattern.format(year=year)
-            required.append(path)
-            if not path.exists():
-                missing.append(path)
-    return required, missing
+        return float(psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024)
+    except Exception:
+        return None
 
 
 def era5_file(weather_root: Path, var: str, year: int) -> Path:
-    folder, pattern = ERA5_PATTERNS[var]
-    return weather_root / folder / pattern.format(year=year)
+    spec = ERA5_SPECS[var]
+    return weather_root / spec["folder"] / spec["pattern"].format(year=year)
 
 
-def load_city_grid_points(ctx, flags: list[dict]) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
+def required_era5_files(weather_root: Path) -> tuple[pd.DataFrame, list[Path], list[Path]]:
+    rows: list[dict[str, Any]] = []
+    missing_core: list[Path] = []
+    missing_boundary_2019: list[Path] = []
+    for year in [2019] + YEARS:
+        for var in ERA5_SPECS:
+            path = era5_file(weather_root, var, year)
+            row = {
+                "year": year,
+                "variable": var,
+                "path": str(path),
+                "exists": path.exists(),
+                "purpose": "2019_boundary_hours" if year == 2019 else "target_2020_2024",
+            }
+            rows.append(row)
+            if not path.exists() and year == 2019:
+                missing_boundary_2019.append(path)
+            elif not path.exists():
+                missing_core.append(path)
+    return pd.DataFrame(rows), missing_core, missing_boundary_2019
+
+
+def read_city_shapefile(path: Path):
+    import geopandas as gpd
+
+    last_exc: Exception | None = None
+    for encoding in ["gbk", "gb18030"]:
+        try:
+            return gpd.read_file(path, encoding=encoding)
+        except Exception as exc:
+            last_exc = exc
+    if last_exc:
+        raise last_exc
+    return gpd.read_file(path)
+
+
+def read_sample_era5_grid(ctx) -> tuple[np.ndarray, np.ndarray]:
+    import xarray as xr
+
+    sample_path = era5_file(Path(str(ctx.config["weather_root"])), "t2m", 2020)
+    ds = xr.open_dataset(sample_path)
+    try:
+        lat_values = np.asarray(ds["latitude"].values)
+        lon_values = np.asarray(ds["longitude"].values)
+    finally:
+        ds.close()
+    return lat_values, lon_values
+
+
+def load_city_weights(ctx, flags: list[dict]) -> pd.DataFrame | None:
+    path = get_input_paths(ctx.config)["city_weights"]
+    try:
+        weights = pd.read_excel(path, sheet_name="城市月度占比_长表")
+    except Exception as exc:
+        add_qc(flags, MODULE, "SOFT_FAIL", "city_weight_read", "城市月度用电权重读取失败", repr(exc), blocking=True)
+        return None
+
+    required = ["省份中文", "城市中文", "月份", "城市月度用电量", "城市省内占比"]
+    missing_cols = [col for col in required if col not in weights.columns]
+    if missing_cols:
+        add_qc(flags, MODULE, "SOFT_FAIL", "city_weight_columns", "城市月度权重表缺少必要字段", missing_cols, blocking=True)
+        return None
+
+    out = pd.DataFrame(
+        {
+            "province_cn": weights["省份中文"].map(normalize_province),
+            "city_cn": weights["城市中文"].map(normalize_city),
+            "month": pd.to_numeric(weights["月份"], errors="coerce"),
+            "city_power_mwh": pd.to_numeric(weights["城市月度用电量"], errors="coerce"),
+            "city_weight_in_province": pd.to_numeric(weights["城市省内占比"], errors="coerce"),
+        }
+    ).dropna(subset=["province_cn", "city_cn", "month", "city_weight_in_province"])
+    out["month"] = out["month"].astype(int)
+    out = out[(out["month"] >= 1) & (out["month"] <= 12)].copy()
+    out.sort_values(["province_cn", "city_cn", "month"], inplace=True)
+    write_df(out, ctx.tables_dir / "city_monthly_power_weight.csv")
+
+    closure = out.groupby(["province_cn", "month"], as_index=False).agg(
+        city_count=("city_cn", "nunique"),
+        city_weight_sum=("city_weight_in_province", "sum"),
+        city_power_mwh_sum=("city_power_mwh", "sum"),
+    )
+    closure["abs_error"] = closure["city_weight_sum"].sub(1.0).abs()
+    write_df(closure, ctx.tables_dir / "city_monthly_power_weight_qc.csv")
+    bad = closure[closure["abs_error"] > 1e-6]
+    if not bad.empty:
+        add_qc(
+            flags,
+            MODULE,
+            "SOFT_FAIL",
+            "city_weight_closure",
+            "城市月度用电权重在省-月层面不闭合，停止后续 ERA5 抽取",
+            bad.to_dict("records"),
+            blocking=True,
+        )
+        return None
+    add_qc(flags, MODULE, "INFO", "city_weight_closure", "城市月度用电权重省-月闭合通过", {"province_months": int(len(closure))})
+    return out
+
+
+def build_city_era5_mapping(ctx, city_weights: pd.DataFrame, flags: list[dict]) -> pd.DataFrame | None:
     try:
         import geopandas as gpd
-        from shapely.geometry import Point
 
         paths = get_input_paths(ctx.config)
-        sample_ds_path = era5_file(Path(str(ctx.config["weather_root"])), "t2m", 2020)
-        import xarray as xr
-
-        ds = xr.open_dataset(sample_ds_path)
-        lat_values = ds["latitude"].values
-        lon_values = ds["longitude"].values
-        ds.close()
+        lat_values, lon_values = read_sample_era5_grid(ctx)
         lon_grid, lat_grid = np.meshgrid(lon_values, lat_values)
-        flat = pd.DataFrame(
+        grid = pd.DataFrame(
             {
-                "lat_idx": np.repeat(np.arange(len(lat_values)), len(lon_values)),
-                "lon_idx": np.tile(np.arange(len(lon_values)), len(lat_values)),
-                "era5_latitude": lat_grid.ravel(),
-                "era5_longitude": lon_grid.ravel(),
+                "lat_idx": np.repeat(np.arange(len(lat_values)), len(lon_values)).astype(int),
+                "lon_idx": np.tile(np.arange(len(lon_values)), len(lat_values)).astype(int),
+                "era5_latitude": lat_grid.ravel().astype(float),
+                "era5_longitude": lon_grid.ravel().astype(float),
             }
         )
         points = gpd.GeoDataFrame(
-            flat,
-            geometry=gpd.points_from_xy(flat["era5_longitude"], flat["era5_latitude"]),
+            grid,
+            geometry=gpd.points_from_xy(grid["era5_longitude"], grid["era5_latitude"]),
             crs="EPSG:4326",
         )
-        city = gpd.read_file(paths["city_shapefile"], encoding="gbk")
+        city = read_city_shapefile(paths["city_shapefile"])
         if city.crs is None:
             add_qc(flags, MODULE, "SOFT_FAIL", "city_shapefile_crs", "市级边界缺少 CRS，不能安全匹配 ERA5 经纬度", blocking=True)
-            return None, None
+            return None
         city = city.to_crs("EPSG:4326")
+        if "省" not in city.columns or "name" not in city.columns:
+            add_qc(flags, MODULE, "SOFT_FAIL", "city_shapefile_columns", "市级边界缺少 `省` 或 `name` 字段", list(city.columns), blocking=True)
+            return None
         city["province_cn"] = city["省"].map(normalize_province)
         city["city_cn"] = city["name"].map(normalize_city)
-        weights = load_city_weights(ctx, flags)
-        if weights is None:
-            return None, None
-        needed = weights[["province_cn", "city_cn"]].drop_duplicates()
-        city = city.merge(needed, on=["province_cn", "city_cn"], how="inner")
-        if city.empty:
+        needed = city_weights[["province_cn", "city_cn"]].drop_duplicates()
+        city_match = city.merge(needed, on=["province_cn", "city_cn"], how="inner")
+        matched = city_match[["province_cn", "city_cn"]].drop_duplicates()
+        missing_city = needed.merge(matched, on=["province_cn", "city_cn"], how="left", indicator=True)
+        missing_city = missing_city[missing_city["_merge"].eq("left_only")][["province_cn", "city_cn"]]
+        if not missing_city.empty:
+            write_df(missing_city, ctx.tables_dir / "city_weight_without_shapefile_match.csv")
+            add_qc(
+                flags,
+                MODULE,
+                "SOFT_FAIL",
+                "city_weight_shapefile_match",
+                "部分城市权重无法匹配市级边界，不能静默丢弃",
+                missing_city.head(100).to_dict("records"),
+                blocking=True,
+            )
+            return None
+        if city_match.empty:
             add_qc(flags, MODULE, "HARD_FAIL", "city_shape_weight_match_empty", "城市权重无法匹配任何市级边界")
-            return None, None
-        bbox = city.total_bounds
+            return None
+
+        bbox = city_match.total_bounds
         points = points[
             points["era5_longitude"].between(bbox[0] - 0.25, bbox[2] + 0.25)
             & points["era5_latitude"].between(bbox[1] - 0.25, bbox[3] + 0.25)
         ].copy()
-        joined = gpd.sjoin(
-            points,
-            city[["province_cn", "city_cn", "geometry"]],
-            how="inner",
-            predicate="within",
-        ).drop(columns=["index_right"], errors="ignore")
-        mapping = pd.DataFrame(joined.drop(columns="geometry"))
-        fallback_rows = []
-        counts = mapping.groupby(["province_cn", "city_cn"]).size().rename("era5_point_count").reset_index()
-        missing = needed.merge(counts[["province_cn", "city_cn"]], on=["province_cn", "city_cn"], how="left", indicator=True)
-        missing = missing[missing["_merge"] == "left_only"][["province_cn", "city_cn"]]
-        if not missing.empty:
-            city_for_fallback = city.merge(missing, on=["province_cn", "city_cn"], how="inner")
-            reps = city_for_fallback.geometry.representative_point()
-            for (_, row), point in zip(city_for_fallback.iterrows(), reps):
+        join_cols = ["province_cn", "city_cn", "geometry"]
+        try:
+            joined = gpd.sjoin(points, city_match[join_cols], how="inner", predicate="within")
+        except TypeError:
+            joined = gpd.sjoin(points, city_match[join_cols], how="inner", op="within")
+        mapping = pd.DataFrame(joined.drop(columns=["geometry", "index_right"], errors="ignore"))
+        mapping["mapping_method"] = "grid_center_within_city_boundary"
+
+        city_counts = (
+            mapping[["province_cn", "city_cn", "lat_idx", "lon_idx"]]
+            .drop_duplicates()
+            .groupby(["province_cn", "city_cn"], as_index=False)
+            .size()
+            .rename(columns={"size": "city_era5_point_count"})
+        )
+        missing_points = needed.merge(city_counts[["province_cn", "city_cn"]], on=["province_cn", "city_cn"], how="left", indicator=True)
+        missing_points = missing_points[missing_points["_merge"].eq("left_only")][["province_cn", "city_cn"]]
+        fallback_rows: list[dict[str, Any]] = []
+        if not missing_points.empty:
+            city_fallback = city_match.merge(missing_points, on=["province_cn", "city_cn"], how="inner")
+            reps = city_fallback.geometry.representative_point()
+            for (_, row), point in zip(city_fallback.iterrows(), reps):
                 lat_idx = int(np.abs(lat_values - point.y).argmin())
                 lon_idx = int(np.abs(lon_values - point.x).argmin())
                 fallback_rows.append(
                     {
+                        "province_cn": row["province_cn"],
+                        "city_cn": row["city_cn"],
                         "lat_idx": lat_idx,
                         "lon_idx": lon_idx,
                         "era5_latitude": float(lat_values[lat_idx]),
                         "era5_longitude": float(lon_values[lon_idx]),
-                        "province_cn": row["province_cn"],
-                        "city_cn": row["city_cn"],
                         "mapping_method": "nearest_representative_for_city_without_grid_center",
                     }
                 )
+            write_df(pd.DataFrame(fallback_rows), ctx.tables_dir / "fallback_city_era5_mapping.csv")
             add_qc(
                 flags,
                 MODULE,
                 "WARN",
                 "city_without_era5_center_fallback",
-                "部分城市边界内没有 ERA5 网格中心，使用城市代表点最近 ERA5 点 fallback",
-                missing.to_dict("records"),
+                "部分城市边界内没有 ERA5 网格中心，使用城市 representative point 最近 ERA5 点",
+                missing_points.to_dict("records"),
                 blocking=False,
             )
-        mapping["mapping_method"] = "grid_center_within_city_boundary"
         if fallback_rows:
             mapping = pd.concat([mapping, pd.DataFrame(fallback_rows)], ignore_index=True)
-        dup = mapping.groupby(["lat_idx", "lon_idx"]).size().reset_index(name="assignments")
-        dup = dup[dup["assignments"] > 1]
-        if not dup.empty:
+        mapping = mapping[["province_cn", "city_cn", "lat_idx", "lon_idx", "era5_latitude", "era5_longitude", "mapping_method"]].drop_duplicates()
+        mapping["lat_idx"] = mapping["lat_idx"].astype(int)
+        mapping["lon_idx"] = mapping["lon_idx"].astype(int)
+
+        city_counts = (
+            mapping[["province_cn", "city_cn", "lat_idx", "lon_idx"]]
+            .drop_duplicates()
+            .groupby(["province_cn", "city_cn"], as_index=False)
+            .size()
+            .rename(columns={"size": "city_era5_point_count"})
+        )
+        mapping = mapping.merge(city_counts, on=["province_cn", "city_cn"], how="left")
+        contributing = (
+            mapping.groupby(["lat_idx", "lon_idx"], as_index=False)
+            .agg(contributing_city_count=("city_cn", "nunique"))
+        )
+        mapping = mapping.merge(contributing, on=["lat_idx", "lon_idx"], how="left")
+        overlaps = mapping[mapping["contributing_city_count"].gt(1)].copy()
+        if not overlaps.empty:
+            write_df(overlaps, ctx.tables_dir / "overlapping_era5_city_assignments.csv")
             add_qc(
                 flags,
                 MODULE,
                 "WARN",
                 "era5_point_multiple_city_assignments",
-                "部分 ERA5 点被多个城市边界覆盖；权重将在省月点层面合并",
-                {"duplicate_point_count": int(len(dup))},
+                "部分 ERA5 点被多个城市覆盖；后续按省-月-点层面汇总权重",
+                {"overlap_rows": int(len(overlaps)), "overlap_points": int(overlaps[["lat_idx", "lon_idx"]].drop_duplicates().shape[0])},
                 blocking=False,
             )
-        counts = mapping.groupby(["province_cn", "city_cn"]).size().rename("era5_point_count").reset_index()
-        mapping = mapping.merge(counts, on=["province_cn", "city_cn"], how="left")
-        point_weights = weights.merge(mapping, on=["province_cn", "city_cn"], how="left")
-        if point_weights[["lat_idx", "lon_idx"]].isna().any().any():
-            add_qc(flags, MODULE, "HARD_FAIL", "city_weight_grid_mapping_missing", "城市月度权重仍有城市无法映射到 ERA5 点")
-            return None, None
-        point_weights["point_weight_raw"] = point_weights["city_weight"] / point_weights["era5_point_count"]
-        point_weights = (
-            point_weights.groupby(["province_cn", "month", "lat_idx", "lon_idx", "era5_latitude", "era5_longitude"], as_index=False)
-            .agg(point_weight_raw=("point_weight_raw", "sum"), contributing_city_count=("city_cn", "nunique"))
+
+        count_qc = city_counts.sort_values(["province_cn", "city_cn"]).copy()
+        write_df(count_qc, ctx.tables_dir / "city_era5_point_count_qc.csv")
+        write_df(
+            mapping.sort_values(["province_cn", "city_cn", "lat_idx", "lon_idx"]),
+            ctx.tables_dir / "era5_city_grid_point_mapping.csv",
         )
-        sums = point_weights.groupby(["province_cn", "month"])["point_weight_raw"].sum().rename("province_month_weight_sum").reset_index()
-        point_weights = point_weights.merge(sums, on=["province_cn", "month"], how="left")
-        point_weights["point_weight"] = point_weights["point_weight_raw"] / point_weights["province_month_weight_sum"]
-        bad = sums[sums["province_month_weight_sum"].sub(1.0).abs() > 1e-6]
-        if not bad.empty:
-            add_qc(flags, MODULE, "WARN", "era5_point_weight_renormalized", "省月 ERA5 点权重和非 1，已重归一", bad.head(50).to_dict("records"), blocking=False)
-        mapping = mapping[["province_cn", "city_cn", "lat_idx", "lon_idx", "era5_latitude", "era5_longitude", "era5_point_count", "mapping_method"]].drop_duplicates()
-        return mapping, point_weights
+        return mapping
     except Exception as exc:
         add_qc(flags, MODULE, "HARD_FAIL", "city_grid_point_mapping", "市级边界到 ERA5 网格点映射失败", repr(exc))
-        return None, None
-
-
-def load_city_weights(ctx, flags: list[dict]) -> pd.DataFrame | None:
-    try:
-        path = get_input_paths(ctx.config)["city_weights"]
-        weights = pd.read_excel(path, sheet_name="城市月度占比_长表")
-        weights["province_cn"] = weights["省份中文"].map(normalize_province)
-        weights["city_cn"] = weights["城市中文"].map(normalize_city)
-        weights["month"] = pd.to_numeric(weights["月份"], errors="coerce").astype("Int64")
-        weights["city_weight"] = pd.to_numeric(weights["城市省内占比"], errors="coerce")
-        closure = weights.groupby(["province_cn", "month"])["city_weight"].sum().reset_index()
-        if (closure["city_weight"].sub(1.0).abs() > 1e-6).any():
-            add_qc(flags, MODULE, "SOFT_FAIL", "city_weight_closure", "城市月度用电权重不闭合", closure.to_dict("records"), blocking=True)
-        return weights[["province_cn", "city_cn", "month", "city_weight"]].dropna()
-    except Exception as exc:
-        add_qc(flags, MODULE, "SOFT_FAIL", "city_weight_read", "城市月度用电权重读取失败", repr(exc), blocking=True)
         return None
 
 
-def write_blocker(ctx, missing: list[Path], flags: list[dict]) -> None:
-    text = "# Module 02 Blocker: ERA5 Time Alignment\n\n"
-    text += "The configured policy is strict UTC-to-Beijing alignment. For Beijing-time 2020-01-01 00:00 to 07:00, ERA5 source hours must come from 2019-12-31 16:00 to 23:00 UTC.\n\n"
-    text += "Missing required files:\n\n"
-    for path in missing:
-        text += f"- `{path}`\n"
-    text += "\nNo boundary-hour filling or direct Beijing-time reinterpretation was applied.\n"
-    write_markdown(ctx.reports_dir / "city_weather_weighting_blocker_report.md", text)
-    write_markdown(ctx.run_dir / "city_weather_weighting_blocker_report.md", text)
-    add_qc(
-        flags,
-        MODULE,
-        "SOFT_FAIL",
-        "era5_2019_boundary_missing",
-        "严格 UTC->北京时间对齐缺少 2019 年末边界小时文件，模块 02 阻断",
-        [str(p) for p in missing],
-        blocking=True,
+def build_point_weights(ctx, city_weights: pd.DataFrame, mapping: pd.DataFrame, flags: list[dict]) -> pd.DataFrame | None:
+    expanded = city_weights.merge(mapping, on=["province_cn", "city_cn"], how="left")
+    if expanded[["lat_idx", "lon_idx", "city_era5_point_count"]].isna().any().any():
+        missing = expanded[expanded[["lat_idx", "lon_idx", "city_era5_point_count"]].isna().any(axis=1)]
+        add_qc(
+            flags,
+            MODULE,
+            "HARD_FAIL",
+            "city_weight_grid_mapping_missing",
+            "城市月度权重仍有城市无法映射到 ERA5 点",
+            missing[["province_cn", "city_cn"]].drop_duplicates().to_dict("records"),
+        )
+        return None
+    expanded["city_point_weight"] = expanded["city_weight_in_province"] / expanded["city_era5_point_count"]
+    city_equal_qc = expanded.groupby(["province_cn", "city_cn", "month"], as_index=False).agg(
+        city_era5_point_count=("city_era5_point_count", "first"),
+        city_weight_in_province=("city_weight_in_province", "first"),
+        point_rows=("city_point_weight", "size"),
+        point_weight_min=("city_point_weight", "min"),
+        point_weight_max=("city_point_weight", "max"),
     )
+    city_equal_qc["expected_point_weight"] = city_equal_qc["city_weight_in_province"] / city_equal_qc["city_era5_point_count"]
+    city_equal_qc["max_abs_error"] = np.maximum(
+        (city_equal_qc["point_weight_min"] - city_equal_qc["expected_point_weight"]).abs(),
+        (city_equal_qc["point_weight_max"] - city_equal_qc["expected_point_weight"]).abs(),
+    )
+    write_df(city_equal_qc, ctx.tables_dir / "city_era5_point_weight_qc.csv")
+    bad_city = city_equal_qc[city_equal_qc["max_abs_error"] > 1e-12]
+    if not bad_city.empty:
+        add_qc(flags, MODULE, "HARD_FAIL", "city_point_weight_not_equal", "同一城市内部 ERA5 点权重不一致", bad_city.head(50).to_dict("records"))
+        return None
+
+    point_weights = (
+        expanded.groupby(["province_cn", "month", "lat_idx", "lon_idx", "era5_latitude", "era5_longitude"], as_index=False)
+        .agg(
+            point_weight_raw=("city_point_weight", "sum"),
+            contributing_city_count=("city_cn", "nunique"),
+            contributing_cities=("city_cn", lambda s: ";".join(sorted(set(map(str, s))))),
+        )
+    )
+    closure = point_weights.groupby(["province_cn", "month"], as_index=False).agg(
+        point_count=("point_weight_raw", "size"),
+        contributing_grid_points=("lat_idx", "nunique"),
+        point_weight_raw_sum=("point_weight_raw", "sum"),
+    )
+    closure["raw_abs_error"] = closure["point_weight_raw_sum"].sub(1.0).abs()
+    if (closure["point_weight_raw_sum"] <= 0).any():
+        bad = closure[closure["point_weight_raw_sum"] <= 0]
+        add_qc(flags, MODULE, "HARD_FAIL", "era5_point_weight_nonpositive_sum", "省-月 ERA5 点原始权重和非正", bad.to_dict("records"))
+        return None
+    point_weights = point_weights.merge(closure[["province_cn", "month", "point_weight_raw_sum"]], on=["province_cn", "month"], how="left")
+    point_weights["point_weight"] = point_weights["point_weight_raw"] / point_weights["point_weight_raw_sum"]
+    final_closure = point_weights.groupby(["province_cn", "month"], as_index=False).agg(
+        point_count=("point_weight", "size"),
+        point_weight_sum=("point_weight", "sum"),
+        point_weight_raw_sum=("point_weight_raw", "sum"),
+        max_contributing_city_count=("contributing_city_count", "max"),
+    )
+    final_closure["final_abs_error"] = final_closure["point_weight_sum"].sub(1.0).abs()
+    final_closure["renormalized"] = final_closure["point_weight_raw_sum"].sub(1.0).abs() > 1e-6
+    write_df(final_closure, ctx.tables_dir / "era5_grid_point_weight_qc.csv")
+    renorm = final_closure[final_closure["renormalized"]]
+    if not renorm.empty:
+        add_qc(
+            flags,
+            MODULE,
+            "WARN",
+            "era5_point_weight_renormalized",
+            "省-月 ERA5 点原始权重和偏离 1，已记录并进行显式重归一化",
+            renorm.to_dict("records"),
+            blocking=False,
+        )
+    bad_final = final_closure[final_closure["final_abs_error"] > 1e-6]
+    if not bad_final.empty:
+        add_qc(flags, MODULE, "HARD_FAIL", "era5_point_weight_not_closed", "省-月 ERA5 最终点权重未闭合", bad_final.to_dict("records"))
+        return None
+    point_weights = point_weights[
+        [
+            "province_cn",
+            "month",
+            "lat_idx",
+            "lon_idx",
+            "era5_latitude",
+            "era5_longitude",
+            "point_weight_raw",
+            "point_weight",
+            "contributing_city_count",
+            "contributing_cities",
+            "point_weight_raw_sum",
+        ]
+    ].sort_values(["province_cn", "month", "lat_idx", "lon_idx"])
+    write_df(point_weights, ctx.tables_dir / "era5_grid_point_weights_by_month.csv")
+    add_qc(flags, MODULE, "INFO", "era5_point_weight_closure", "省-月 ERA5 点权重闭合通过", {"province_months": int(len(final_closure))})
+    return point_weights
+
+
+def build_spatial_weights(ctx, flags: list[dict]) -> tuple[pd.DataFrame | None, pd.DataFrame | None, pd.DataFrame | None]:
+    city_weights = load_city_weights(ctx, flags)
+    if city_weights is None:
+        return None, None, None
+    mapping = build_city_era5_mapping(ctx, city_weights, flags)
+    if mapping is None:
+        return city_weights, None, None
+    point_weights = build_point_weights(ctx, city_weights, mapping, flags)
+    return city_weights, mapping, point_weights
 
 
 def write_boundary_fallback_report(ctx, missing: list[Path], flags: list[dict]) -> None:
     text = "# Module 02 ERA5 Boundary Fallback\n\n"
-    text += "The preferred policy is strict UTC-to-Beijing alignment. ERA5 2019 files are missing, so Beijing-time 2020-01-01 00:00 to 07:00 cannot be mapped to 2019-12-31 16:00 to 23:00 UTC.\n\n"
-    text += "Fallback used for those eight hours only: use the first eight available 2020 ERA5 hours with the same Beijing clock labels. All other hours keep UTC-to-Beijing alignment.\n\n"
-    text += "Missing files recorded:\n\n"
+    text += "ERA5 `valid_time` is interpreted as UTC. Strict Beijing-time alignment maps 2020-01-01 00:00-07:00 Beijing time to 2019-12-31 16:00-23:00 UTC.\n\n"
+    text += "The following 2019 boundary files are missing, so those first eight Beijing-time hours use the first eight available 2020 ERA5 hours as an explicit fallback. All later hours keep UTC-to-Beijing alignment.\n\n"
     for path in missing:
         text += f"- `{path}`\n"
     write_markdown(ctx.reports_dir / "era5_boundary_fallback_report.md", text)
@@ -307,213 +449,472 @@ def write_boundary_fallback_report(ctx, missing: list[Path], flags: list[dict]) 
     )
 
 
-def build_weather_if_unblocked(ctx, flags: list[dict]) -> None:
-    """Compute province weather using city-covered ERA5 grid points and monthly city weights."""
-    author = read_required_table(ctx, "author_load_2020_2024_long.csv.gz", compression="gzip")
-    author["datetime_bj"] = pd.to_datetime(author["datetime_bj"])
-    times = pd.DataFrame({"datetime_bj": sorted(author["datetime_bj"].unique())})
-    times["datetime_utc"] = times["datetime_bj"] - pd.Timedelta(hours=8)
-    times["utc_year"] = times["datetime_utc"].dt.year
-    times["month"] = times["datetime_bj"].dt.month
-    times["source_datetime"] = times["datetime_utc"]
-    times["source_year"] = times["utc_year"]
+def build_target_times(ctx, smoke_year: int | None, smoke_month: int | None, use_boundary_fallback: bool) -> pd.DataFrame:
+    if smoke_year and smoke_month:
+        start = pd.Timestamp(year=int(smoke_year), month=int(smoke_month), day=1)
+        end = start + pd.DateOffset(months=1)
+        times = pd.DataFrame({"datetime_bj": pd.date_range(start, end - pd.Timedelta(hours=1), freq="h")})
+    else:
+        author = read_required_table(ctx, "author_load_2020_2024_long.csv.gz", compression="gzip")
+        author["datetime_bj"] = pd.to_datetime(author["datetime_bj"])
+        times = pd.DataFrame({"datetime_bj": sorted(author["datetime_bj"].unique())})
+    times["target_year"] = times["datetime_bj"].dt.year
+    times["target_month"] = times["datetime_bj"].dt.month
+    times["source_datetime"] = times["datetime_bj"] - pd.Timedelta(hours=8)
+    times["source_year"] = times["source_datetime"].dt.year
+    times["time_alignment_method"] = "strict_utc_to_bj"
     boundary_mask = times["source_year"].lt(2020)
-    if boundary_mask.any():
+    if boundary_mask.any() and use_boundary_fallback:
         times.loc[boundary_mask, "source_datetime"] = times.loc[boundary_mask, "datetime_bj"]
         times.loc[boundary_mask, "source_year"] = 2020
         times.loc[boundary_mask, "time_alignment_method"] = "fallback_2020_first_hours_for_missing_2019_boundary"
-        times.loc[~boundary_mask, "time_alignment_method"] = "strict_utc_to_bj"
-    else:
-        times["time_alignment_method"] = "strict_utc_to_bj"
-    write_df(
-        times.groupby(["time_alignment_method", "source_year"], as_index=False).agg(
-            rows=("datetime_bj", "count"),
-            min_datetime_bj=("datetime_bj", "min"),
-            max_datetime_bj=("datetime_bj", "max"),
-            min_source_datetime=("source_datetime", "min"),
-            max_source_datetime=("source_datetime", "max"),
-        ),
-        ctx.tables_dir / "weather_time_alignment_qc.csv",
-    )
-    grid_mapping, point_weights = load_city_grid_points(ctx, flags)
-    if grid_mapping is None or point_weights is None:
-        return
-    write_df(grid_mapping, ctx.tables_dir / "era5_city_grid_point_mapping.csv")
-    write_df(point_weights, ctx.tables_dir / "era5_grid_point_weights_by_month.csv")
-    weight_qc = point_weights.groupby(["province_cn", "month"], as_index=False).agg(
-        point_count=("point_weight", "size"),
-        weight_sum=("point_weight", "sum"),
-        contributing_grid_points=("lat_idx", "nunique"),
-    )
-    write_df(weight_qc, ctx.tables_dir / "era5_grid_point_weight_qc.csv")
-    if (weight_qc["weight_sum"].sub(1.0).abs() > 1e-6).any():
-        add_qc(flags, MODULE, "HARD_FAIL", "era5_point_weight_not_closed", "省月 ERA5 点权重未闭合")
-        return
+    times["source_year"] = times["source_year"].astype(int)
+    return times
 
+
+def write_time_alignment_qc(ctx, times: pd.DataFrame) -> None:
+    qc = times.groupby(["time_alignment_method", "target_year", "target_month", "source_year"], as_index=False).agg(
+        rows=("datetime_bj", "count"),
+        min_datetime_bj=("datetime_bj", "min"),
+        max_datetime_bj=("datetime_bj", "max"),
+        min_source_datetime=("source_datetime", "min"),
+        max_source_datetime=("source_datetime", "max"),
+    )
+    write_df(qc, ctx.tables_dir / "weather_time_alignment_qc.csv")
+
+
+def transform_values(values: np.ndarray, transform: str) -> np.ndarray:
+    values = values.astype(np.float32, copy=False)
+    if transform == "kelvin_to_c":
+        return values - np.float32(273.15)
+    if transform == "j_m2_to_w_m2":
+        return values / np.float32(3600.0)
+    return values
+
+
+def extract_month_variable(
+    ctx,
+    target_year: int,
+    target_month: int,
+    var: str,
+    month_times: pd.DataFrame,
+    month_weights: pd.DataFrame,
+) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
+    import xarray as xr
+
+    started = time.perf_counter()
+    out_col = ERA5_SPECS[var]["output"]
     weather_root = Path(str(ctx.config["weather_root"]))
-    unit_transform = {
-        "t2m": "kelvin_to_c",
-        "d2m": "kelvin_to_c",
-        "u10": "none",
-        "v10": "none",
-        "ssrd": "j_m2_to_w_m2",
-        "sp": "none",
-    }
-    tasks: list[dict] = []
-    for source_year, year_times in times.groupby("source_year", sort=True):
-        year_times = year_times.sort_values("datetime_bj").copy()
+    month_times = month_times.sort_values("datetime_bj").reset_index(drop=True)
+    point_base = (
+        month_weights[["lat_idx", "lon_idx"]]
+        .drop_duplicates()
+        .sort_values(["lat_idx", "lon_idx"])
+        .reset_index(drop=True)
+    )
+    point_base["point_id"] = np.arange(len(point_base), dtype=int)
+    weights = month_weights.merge(point_base, on=["lat_idx", "lon_idx"], how="left")
+    aggregated_parts: list[pd.DataFrame] = []
+    qc_rows: list[dict[str, Any]] = []
+
+    for source_year, time_sub in month_times.groupby("source_year", sort=True):
         source_year_int = int(source_year)
-        if source_year_int < 2020 or source_year_int > 2024:
-            add_qc(flags, MODULE, "HARD_FAIL", "era5_source_year_out_of_range", "fallback 后仍出现不可读取 ERA5 年份", {"source_year": source_year_int})
-            return
-        for var in ERA5_PATTERNS:
-            ds_path = era5_file(weather_root, var, source_year_int)
-            if not ds_path.exists():
-                add_qc(flags, MODULE, "HARD_FAIL", f"era5_missing_{var}_{source_year_int}", "ERA5 文件缺失，无法继续", str(ds_path))
-                return
-            tasks.append(
-                {
-                    "source_year": source_year_int,
-                    "var": var,
-                    "ds_path": str(ds_path),
-                    "year_times": year_times[["datetime_bj", "source_datetime", "month", "time_alignment_method"]].copy(),
-                    "point_weights": point_weights[["province_cn", "month", "lat_idx", "lon_idx", "point_weight"]].copy(),
-                    "unit_transform": unit_transform[var],
-                }
+        path = era5_file(weather_root, var, source_year_int)
+        if not path.exists():
+            raise FileNotFoundError(f"ERA5 file missing for {var} {source_year_int}: {path}")
+        ds = xr.open_dataset(path)
+        try:
+            data_var = var if var in ds.data_vars else list(ds.data_vars)[0]
+            da = ds[data_var].isel(
+                latitude=xr.DataArray(point_base["lat_idx"].astype(int).to_numpy(), dims="point"),
+                longitude=xr.DataArray(point_base["lon_idx"].astype(int).to_numpy(), dims="point"),
             )
+            time_index = pd.DatetimeIndex(pd.to_datetime(ds["valid_time"].values))
+            source_dt = pd.to_datetime(time_sub["source_datetime"])
+            indexer = time_index.get_indexer(source_dt)
+            if (indexer < 0).any():
+                missing = time_sub.loc[indexer < 0, ["datetime_bj", "source_datetime"]].head(20).astype(str).to_dict("records")
+                raise ValueError(f"ERA5 time coverage missing for {var} {source_year_int}: {missing}")
+            values = np.asarray(da.isel(valid_time=xr.DataArray(indexer.astype(int), dims="time")).load().values)
+            values = transform_values(values, ERA5_SPECS[var]["unit_transform"])
+        finally:
+            ds.close()
 
-    max_workers = int(ctx.config.get("weather_parallel_workers", 6))
-    max_workers = max(1, min(max_workers, len(tasks), os.cpu_count() or max_workers))
-    add_qc(
-        flags,
-        MODULE,
-        "INFO",
-        "weather_parallel_execution",
-        "ERA5 变量-年份任务采用线程池并行执行；当前 Windows 沙箱不允许 multiprocessing Pipe",
-        {"tasks": len(tasks), "thread_workers": max_workers},
-        blocking=False,
-    )
-    results: dict[tuple[int, str], pd.DataFrame] = {}
-    extraction_qc: list[dict] = []
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        future_map = {pool.submit(_extract_era5_province_task, task): (task["source_year"], task["var"]) for task in tasks}
-        for future in as_completed(future_map):
-            key = future_map[future]
-            try:
-                frame, qc_row = future.result()
-            except Exception as exc:
-                add_qc(flags, MODULE, "HARD_FAIL", "era5_parallel_task_failed", "ERA5 并行抽取任务失败", {"task": key, "error": repr(exc)})
-                return
-            results[key] = frame
-            extraction_qc.append(qc_row)
-    write_df(pd.DataFrame(extraction_qc), ctx.tables_dir / "weather_extraction_qc.csv")
+        time_sub = time_sub.reset_index(drop=True)
+        for province, weights_p in weights.groupby("province_cn", sort=True):
+            point_ids = weights_p["point_id"].astype(int).to_numpy()
+            point_w = weights_p["point_weight"].to_numpy(dtype=np.float32)
+            point_w = point_w / point_w.sum()
+            aggregated_parts.append(
+                pd.DataFrame(
+                    {
+                        "province_cn": province,
+                        "datetime_bj": time_sub["datetime_bj"].to_numpy(),
+                        "source_datetime": time_sub["source_datetime"].to_numpy(),
+                        "source_year": source_year_int,
+                        "time_alignment_method": time_sub["time_alignment_method"].to_numpy(),
+                        out_col: values[:, point_ids].dot(point_w).astype(np.float32),
+                    }
+                )
+            )
+        elapsed = time.perf_counter() - started
+        mem = current_memory_mb()
+        row = {
+            "variable": var,
+            "output_column": out_col,
+            "target_year": int(target_year),
+            "target_month": int(target_month),
+            "source_year": source_year_int,
+            "selected_point_count": int(len(point_base)),
+            "loaded_matrix_shape": str(tuple(values.shape)),
+            "elapsed_seconds": round(elapsed, 3),
+            "memory_mb": round(mem, 1) if mem is not None else np.nan,
+            "file": str(path),
+        }
+        qc_rows.append(row)
+        print(
+            "[module02] extracted "
+            f"var={var} target={target_year}-{target_month:02d} source_year={source_year_int} "
+            f"points={len(point_base)} shape={tuple(values.shape)} elapsed={elapsed:.2f}s memory_mb={row['memory_mb']}",
+            flush=True,
+        )
+        del values
+        gc.collect()
 
-    weather_years: list[pd.DataFrame] = []
-    for source_year, year_times in times.groupby("source_year", sort=True):
-        source_year_int = int(source_year)
-        base = results[(source_year_int, "t2m")].rename(columns={"t2m": "temperature_c"})
-        for var, out_col in [
-            ("d2m", "dewpoint_c"),
-            ("u10", "u10_ms"),
-            ("v10", "v10_ms"),
-            ("ssrd", "solar_wm2"),
-            ("sp", "surface_pressure_pa"),
-        ]:
-            part = results[(source_year_int, var)].rename(columns={var: out_col})
-            base = base.merge(part[["province_cn", "datetime_bj", out_col]], on=["province_cn", "datetime_bj"], how="left")
-        weather_years.append(base)
-    weather = pd.concat(weather_years, ignore_index=True)
-    weather["weather_weight_method"] = "city_monthly_electricity_era5_grid_points"
-    weather["relative_humidity_pct"] = 100.0 * np.exp(
-        17.625 * weather["dewpoint_c"] / (243.04 + weather["dewpoint_c"])
-        - 17.625 * weather["temperature_c"] / (243.04 + weather["temperature_c"])
+    return pd.concat(aggregated_parts, ignore_index=True), qc_rows
+
+
+def relative_humidity_from_dewpoint(temperature_c: pd.Series, dewpoint_c: pd.Series) -> pd.Series:
+    rh = 100.0 * np.exp(
+        17.625 * dewpoint_c / (243.04 + dewpoint_c)
+        - 17.625 * temperature_c / (243.04 + temperature_c)
     )
-    weather["relative_humidity_pct"] = weather["relative_humidity_pct"].clip(0, 100)
+    return rh.clip(0, 100)
+
+
+def specific_humidity_gkg(dewpoint_c: pd.Series, surface_pressure_pa: pd.Series) -> pd.Series:
+    vapor_pressure_pa = 611.2 * np.exp(17.67 * dewpoint_c / (dewpoint_c + 243.5))
+    q = 0.622 * vapor_pressure_pa / (surface_pressure_pa - 0.378 * vapor_pressure_pa)
+    return q * 1000.0
+
+
+def finite_exp_smooth(values: np.ndarray, window_hours: int, decay_lambda: float) -> np.ndarray:
+    weights = np.exp(-decay_lambda * np.arange(window_hours + 1, dtype=float))
+    valid = np.isfinite(values).astype(float)
+    filled = np.where(np.isfinite(values), values, 0.0)
+    numerator = np.convolve(filled, weights, mode="full")[: len(values)]
+    denominator = np.convolve(valid, weights, mode="full")[: len(values)]
+    out = numerator / np.where(denominator == 0, np.nan, denominator)
+    return out
+
+
+def add_bait_hdd_cdd(weather: pd.DataFrame) -> pd.DataFrame:
+    weather = weather.sort_values(["province_cn", "datetime_bj"]).copy()
+    weather["relative_humidity_pct"] = relative_humidity_from_dewpoint(weather["temperature_c"], weather["dewpoint_c"])
+    weather["specific_humidity_gkg"] = specific_humidity_gkg(weather["dewpoint_c"], weather["surface_pressure_pa"])
     weather["wind_speed_ms"] = np.sqrt(weather["u10_ms"] ** 2 + weather["v10_ms"] ** 2)
-    # Transparent BAIT approximation; method report documents that exact paper coefficients were unavailable.
-    weather["bait_raw_c"] = weather["temperature_c"] + 0.002 * weather["solar_wm2"] - 0.7 * weather["wind_speed_ms"] + 0.03 * (weather["relative_humidity_pct"] - 50.0)
-    weather.sort_values(["province_cn", "datetime_bj"], inplace=True)
-    alpha = 1.0 - np.exp(-1.0 / 48.0)
-    weather["bait_smoothed_c"] = weather.groupby("province_cn")["bait_raw_c"].transform(lambda s: s.ewm(alpha=alpha, adjust=False).mean())
-    blend = 1.0 / (1.0 + np.exp(-(weather["temperature_c"] - 26.0) / 2.0))
-    weather["bait_c"] = (1.0 - blend) * weather["bait_smoothed_c"] + blend * (0.5 * weather["bait_smoothed_c"] + 0.5 * weather["temperature_c"])
+    weather["bait_k_s"] = 100.0 + 7.0 * weather["temperature_c"]
+    weather["bait_k_w"] = 4.5 - 0.025 * weather["temperature_c"]
+    weather["bait_k_h"] = np.exp(1.0 + 0.06 * weather["temperature_c"])
+    sign_term = np.sign(weather["temperature_c"] - BAIT_PARAMS["t_star_c"])
+    weather["bait_raw_c"] = (
+        weather["temperature_c"]
+        + BAIT_PARAMS["x"] * (weather["solar_wm2"] - weather["bait_k_s"])
+        - BAIT_PARAMS["y"] * (weather["wind_speed_ms"] - weather["bait_k_w"])
+        + BAIT_PARAMS["z"] * (weather["specific_humidity_gkg"] - weather["bait_k_h"]) * sign_term
+    )
+    smoothed = []
+    for _, sub in weather.groupby("province_cn", sort=False):
+        values = sub["bait_raw_c"].to_numpy(dtype=float)
+        smoothed.append(
+            pd.Series(
+                finite_exp_smooth(values, int(BAIT_PARAMS["smooth_window_hours"]), float(BAIT_PARAMS["smooth_lambda"])),
+                index=sub.index,
+            )
+        )
+    weather["bait_smoothed_c"] = pd.concat(smoothed).sort_index()
+    lower = BAIT_PARAMS["blend_lower_c"]
+    upper = BAIT_PARAMS["blend_upper_c"]
+    weather["bait_blend_k"] = np.where(
+        weather["temperature_c"] < lower,
+        -5.0,
+        np.where(
+            weather["temperature_c"] > upper,
+            5.0,
+            (weather["temperature_c"] - 0.5 * (upper + lower)) * 10.0 / (upper - lower),
+        ),
+    )
+    weather["bait_blend_factor"] = 0.5 / (1.0 + np.exp(-weather["bait_blend_k"]))
+    weather["bait_c"] = weather["bait_smoothed_c"] * (1.0 - weather["bait_blend_factor"]) + weather["temperature_c"] * weather["bait_blend_factor"]
     weather["region"] = np.where(weather["province_cn"].isin(NORTH_PROVINCES), "north", "south")
     weather["heat_threshold_c"] = np.where(weather["region"].eq("north"), 14.713, 16.818)
     weather["cool_threshold_c"] = np.where(weather["region"].eq("north"), 22.253, 22.631)
     weather["hdd_hour"] = np.maximum(weather["heat_threshold_c"] - weather["bait_c"], 0.0) / 24.0
     weather["cdd_hour"] = np.maximum(weather["bait_c"] - weather["cool_threshold_c"], 0.0) / 24.0
+    weather["weather_weight_method"] = "city_monthly_electricity_era5_grid_points"
+    weather["humidity_method"] = "specific_humidity_gkg_from_dewpoint_and_surface_pressure"
+    weather["bait_formula"] = "paper_eq4_eq11_finite_48h"
     weather["year"] = weather["datetime_bj"].dt.year
     weather["month"] = weather["datetime_bj"].dt.month
-    coeff = read_power_coefficients(ctx)
-    thermal = weather.merge(coeff[["province_cn", "year", "p_heat_gwh_per_degree_day", "p_cool_gwh_per_degree_day"]], on=["province_cn", "year"], how="left")
-    if thermal[["p_heat_gwh_per_degree_day", "p_cool_gwh_per_degree_day"]].isna().any().any():
-        add_qc(flags, MODULE, "HARD_FAIL", "thermal_coeff_missing", "冷热系数无法覆盖天气特征表")
-        return
-    thermal["heating_load_mw"] = thermal["p_heat_gwh_per_degree_day"] * thermal["hdd_hour"] * 1000.0
-    thermal["cooling_load_mw"] = thermal["p_cool_gwh_per_degree_day"] * thermal["cdd_hour"] * 1000.0
-    write_df(
-        weather[
-            [
-                "province_cn",
-                "datetime_bj",
-                "year",
-                "month",
-                "time_alignment_method",
-                "weather_weight_method",
-                "temperature_c",
-                "dewpoint_c",
-                "relative_humidity_pct",
-                "wind_speed_ms",
-                "solar_wm2",
-                "surface_pressure_pa",
-                "bait_raw_c",
-                "bait_smoothed_c",
-                "bait_c",
-                "heat_threshold_c",
-                "cool_threshold_c",
-                "hdd_hour",
-                "cdd_hour",
-            ]
-        ],
-        ctx.tables_dir / "weather_features_hourly_province_2020_2024.csv.gz",
+    return weather
+
+
+def write_weather_qc(ctx, weather: pd.DataFrame, thermal: pd.DataFrame) -> None:
+    unit_qc = pd.DataFrame(
+        [
+            {"paper_variable": "T", "local_column": "temperature_c", "source": "t2m", "unit_conversion": "K to C"},
+            {"paper_variable": "S", "local_column": "solar_wm2", "source": "ssrd", "unit_conversion": "J/m2/hour divided by 3600 to W/m2"},
+            {"paper_variable": "W", "local_column": "wind_speed_ms", "source": "u10,v10", "unit_conversion": "sqrt(u10^2+v10^2), m/s"},
+            {"paper_variable": "H", "local_column": "specific_humidity_gkg", "source": "d2m,sp", "unit_conversion": "dewpoint and pressure to specific humidity, g/kg"},
+        ]
     )
-    write_df(thermal, ctx.tables_dir / "heating_cooling_load_2020_2024.csv.gz")
-    summary = thermal.groupby(["province_cn", "year"], as_index=False).agg(
+    write_df(unit_qc, ctx.tables_dir / "weather_variable_unit_qc.csv")
+    bait_qc = weather.groupby(["province_cn", "year"], as_index=False).agg(
+        temperature_min_c=("temperature_c", "min"),
+        temperature_max_c=("temperature_c", "max"),
+        rh_min_pct=("relative_humidity_pct", "min"),
+        rh_max_pct=("relative_humidity_pct", "max"),
+        specific_humidity_min_gkg=("specific_humidity_gkg", "min"),
+        specific_humidity_max_gkg=("specific_humidity_gkg", "max"),
+        bait_min_c=("bait_c", "min"),
+        bait_p01_c=("bait_c", lambda s: s.quantile(0.01)),
+        bait_p50_c=("bait_c", "median"),
+        bait_p99_c=("bait_c", lambda s: s.quantile(0.99)),
+        bait_max_c=("bait_c", "max"),
+        hdd_nonzero_hours=("hdd_hour", lambda s: int((s > 0).sum())),
+        cdd_nonzero_hours=("cdd_hour", lambda s: int((s > 0).sum())),
+    )
+    write_df(bait_qc, ctx.tables_dir / "bait_hdd_cdd_qc.csv")
+    load_qc = thermal.groupby(["province_cn", "year"], as_index=False).agg(
         heating_energy_mwh=("heating_load_mw", "sum"),
         cooling_energy_mwh=("cooling_load_mw", "sum"),
         heating_peak_mw=("heating_load_mw", "max"),
         cooling_peak_mw=("cooling_load_mw", "max"),
-        bait_min_c=("bait_c", "min"),
-        bait_max_c=("bait_c", "max"),
+        hdd_sum=("hdd_hour", "sum"),
+        cdd_sum=("cdd_hour", "sum"),
     )
-    write_df(summary, ctx.tables_dir / "heating_cooling_summary_by_province_year.csv")
-    qc = thermal.groupby(["province_cn", "year"], as_index=False).agg(rh_min=("relative_humidity_pct", "min"), rh_max=("relative_humidity_pct", "max"))
-    write_df(qc, ctx.tables_dir / "weather_weighting_qc.csv")
+    write_df(load_qc, ctx.tables_dir / "heating_cooling_summary_by_province_year.csv")
+    write_df(bait_qc, ctx.tables_dir / "weather_weighting_qc.csv")
+
+
+def write_method_report(ctx) -> None:
+    text = """# Module 02 Method Report
+
+## Spatial Exposure
+
+Province-level hourly ERA5 exposure is constructed from city monthly electricity
+weights. For city `c` in province `p` and month `m`, the city weight
+`city_weight_in_province[c,m]` is divided equally across all ERA5 grid centers
+covered by the city boundary. Province-month point weights are checked and
+normalized only after recording the raw closure.
+
+## ERA5 Variables
+
+| Paper variable | Local ERA5 input | Output column | Unit handling |
+|---|---|---|---|
+| T | `t2m` | `temperature_c` | K to C |
+| S | `ssrd` | `solar_wm2` | J/m2/hour divided by 3600 |
+| W | `u10`, `v10` | `wind_speed_ms` | sqrt(u10^2 + v10^2), m/s |
+| H | `d2m`, `sp` | `specific_humidity_gkg` | dewpoint and surface pressure to g/kg |
+
+Relative humidity is retained as `relative_humidity_pct` for QC only and is not
+used as the BAIT humidity term.
+
+## BAIT Eq.(4)-Eq.(11)
+
+```text
+oBAIT = T + 0.012*(S-kS) - 0.2*(W-kW) + 0.05*(H-kH)*sign(T-16)
+kS = 100 + 7*T
+kW = 4.5 - 0.025*T
+kH = exp(1 + 0.06*T)
+```
+
+`sBAIT` uses the finite 48-hour exponential window
+`sum(q=0..48, exp(-0.10232*q) * oBAIT[t-q]) / sum(q=0..48, exp(-0.10232*q))`,
+with the denominator truncated to available prior hours at the start of each
+province series.
+
+Temperature blending uses `B = 0.5/(1+exp(-kB))`, with `B_L=15 C` and
+`B_U=23 C`, then `BAIT = sBAIT*(1-B) + T*B`.
+
+HDD/CDD thresholds use the reset-plan north/south values:
+
+```text
+north: heat_threshold_c = 14.713, cool_threshold_c = 22.253
+south: heat_threshold_c = 16.818, cool_threshold_c = 22.631
+```
+"""
+    write_markdown(ctx.reports_dir / "method_report_module02.md", text)
+
+
+def merge_month_variable_frames(var_frames: list[pd.DataFrame]) -> pd.DataFrame:
+    base = var_frames[0]
+    for part in var_frames[1:]:
+        value_cols = [col for col in part.columns if col not in {"province_cn", "datetime_bj", "source_datetime", "source_year", "time_alignment_method"}]
+        base = base.merge(part[["province_cn", "datetime_bj"] + value_cols], on=["province_cn", "datetime_bj"], how="left")
+    return base
+
+
+def build_weather(ctx, point_weights: pd.DataFrame, flags: list[dict], args: argparse.Namespace) -> None:
+    smoke_year = args.smoke_year
+    smoke_month = args.smoke_month
+    smoke_province = normalize_province(args.smoke_province) if args.smoke_province else None
+    if (smoke_year is None) ^ (smoke_month is None):
+        add_qc(flags, MODULE, "HARD_FAIL", "smoke_year_month_pair", "`--smoke-year` 与 `--smoke-month` 必须同时提供")
+        return
+
+    times = build_target_times(ctx, smoke_year, smoke_month, use_boundary_fallback=bool(args.use_boundary_fallback))
+    if smoke_year and smoke_month:
+        times = times[(times["target_year"].eq(smoke_year)) & (times["target_month"].eq(smoke_month))].copy()
+    write_time_alignment_qc(ctx, times)
+
+    if smoke_province:
+        point_weights = point_weights[point_weights["province_cn"].eq(smoke_province)].copy()
+        if point_weights.empty:
+            add_qc(flags, MODULE, "HARD_FAIL", "smoke_province_no_weights", "smoke 省份没有 ERA5 点权重", smoke_province)
+            return
+
+    variables = [args.smoke_variable] if args.smoke_variable else list(ERA5_SPECS)
+    max_workers = int(ctx.config.get("weather_parallel_workers", 1))
+    capped_workers = max(1, min(max_workers, 2))
+    add_qc(
+        flags,
+        MODULE,
+        "INFO",
+        "weather_reader_parallel_policy",
+        "ERA5 读取按 year-month-variable 流式执行；默认单 worker，最多 2",
+        {"configured_workers": max_workers, "capped_workers": capped_workers, "active_mode": "sequential_streaming"},
+    )
+
+    tmp_dir = ctx.run_dir / "tmp_module02_weather"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    extraction_qc: list[dict[str, Any]] = []
+    tmp_files: list[Path] = []
+
+    for (target_year, target_month), month_times in times.groupby(["target_year", "target_month"], sort=True):
+        month_weights = point_weights[point_weights["month"].astype(int).eq(int(target_month))].copy()
+        if month_weights.empty:
+            add_qc(flags, MODULE, "HARD_FAIL", "month_point_weights_missing", "指定月份缺少 ERA5 点权重", {"month": int(target_month)})
+            return
+        var_frames: list[pd.DataFrame] = []
+        for var in variables:
+            frame, qc_rows = extract_month_variable(ctx, int(target_year), int(target_month), var, month_times, month_weights)
+            var_frames.append(frame)
+            extraction_qc.extend(qc_rows)
+            write_df(pd.DataFrame(extraction_qc), ctx.tables_dir / "weather_extraction_qc.csv")
+        month_weather = merge_month_variable_frames(var_frames)
+        month_weather["target_year"] = int(target_year)
+        month_weather["target_month"] = int(target_month)
+        if args.smoke_variable:
+            out = ctx.tables_dir / f"smoke_weather_variable_{args.smoke_variable}_{int(target_year)}_{int(target_month):02d}.csv.gz"
+            write_df(month_weather, out)
+            add_qc(flags, MODULE, "INFO", "module02_smoke_variable_output", "单变量 ERA5 抽取 smoke test 完成", {"path": str(out), "rows": int(len(month_weather))})
+            return
+        tmp_path = tmp_dir / f"tmp_weather_province_hourly_{int(target_year)}_{int(target_month):02d}.csv.gz"
+        write_df(month_weather, tmp_path)
+        tmp_files.append(tmp_path)
+        print(f"[module02] wrote monthly weather temp file {tmp_path}", flush=True)
+        del month_weather, var_frames
+        gc.collect()
+
+    raw_weather = pd.concat(
+        (pd.read_csv(path, compression="gzip", encoding="utf-8-sig", parse_dates=["datetime_bj", "source_datetime"]) for path in tmp_files),
+        ignore_index=True,
+    )
+    missing = [col for col in REQUIRED_WEATHER_COLS if col not in raw_weather.columns or raw_weather[col].isna().any()]
+    if missing:
+        add_qc(flags, MODULE, "HARD_FAIL", "weather_required_columns_missing", "BAIT 所需 ERA5 变量缺失或存在空值", missing)
+        return
+    weather = add_bait_hdd_cdd(raw_weather)
+    coeff = read_power_coefficients(ctx)
+    thermal = weather.merge(
+        coeff[["province_cn", "year", "p_heat_gwh_per_degree_day", "p_cool_gwh_per_degree_day"]],
+        on=["province_cn", "year"],
+        how="left",
+    )
+    if thermal[["p_heat_gwh_per_degree_day", "p_cool_gwh_per_degree_day"]].isna().any().any():
+        missing_coeff = thermal.loc[
+            thermal[["p_heat_gwh_per_degree_day", "p_cool_gwh_per_degree_day"]].isna().any(axis=1),
+            ["province_cn", "year"],
+        ].drop_duplicates()
+        add_qc(flags, MODULE, "HARD_FAIL", "thermal_coeff_missing", "冷热系数无法覆盖天气特征表", missing_coeff.to_dict("records"))
+        return
+    thermal["heating_load_mw"] = thermal["p_heat_gwh_per_degree_day"] * thermal["hdd_hour"] * 1000.0
+    thermal["cooling_load_mw"] = thermal["p_cool_gwh_per_degree_day"] * thermal["cdd_hour"] * 1000.0
+
+    weather_cols = [
+        "province_cn",
+        "datetime_bj",
+        "year",
+        "month",
+        "source_datetime",
+        "source_year",
+        "time_alignment_method",
+        "weather_weight_method",
+        "humidity_method",
+        "bait_formula",
+        "temperature_c",
+        "dewpoint_c",
+        "relative_humidity_pct",
+        "specific_humidity_gkg",
+        "u10_ms",
+        "v10_ms",
+        "wind_speed_ms",
+        "solar_wm2",
+        "surface_pressure_pa",
+        "bait_k_s",
+        "bait_k_w",
+        "bait_k_h",
+        "bait_raw_c",
+        "bait_smoothed_c",
+        "bait_blend_k",
+        "bait_blend_factor",
+        "bait_c",
+        "heat_threshold_c",
+        "cool_threshold_c",
+        "hdd_hour",
+        "cdd_hour",
+    ]
+    write_df(weather[weather_cols], ctx.tables_dir / "weather_features_hourly_province_2020_2024.csv.gz")
+    write_df(thermal, ctx.tables_dir / "heating_cooling_load_2020_2024.csv.gz")
     write_df(coeff, ctx.tables_dir / "power_coefficients_long.csv")
-    write_markdown(
-        ctx.reports_dir / "method_report_module02.md",
-        "# Module 02 Method Note\n\nBAIT is implemented as a transparent approximation using temperature, solar radiation, wind speed, humidity, 48-hour exponential smoothing, and high-temperature sigmoid blending. Exact paper-side fitted BAIT coefficients were not available in the input files, so this difference is reported explicitly.\n",
+    write_weather_qc(ctx, weather, thermal)
+    write_method_report(ctx)
+    add_qc(
+        flags,
+        MODULE,
+        "INFO",
+        "module02_outputs",
+        "模块 02 城市权重 ERA5、BAIT/HDD/CDD 与冷热负荷输出完成",
+        {"weather_rows": int(len(weather)), "thermal_rows": int(len(thermal)), "monthly_temp_files": len(tmp_files)},
     )
-    add_qc(flags, MODULE, "INFO", "module02_outputs", "模块 02 天气和冷热负荷输出完成", {"weather_rows": int(len(weather)), "thermal_rows": int(len(thermal))}, blocking=False)
 
 
 def main() -> None:
-    args = parse_args("Module 02: reconstruct weather features and thermal load")
+    args = parse_module_args()
     ctx = init_context(args, MODULE)
     flags: list[dict] = []
-    paths = get_input_paths(ctx.config)
     try:
-        required, missing = required_era5_files(paths["weather_root"])
-        coverage = pd.DataFrame(
-            [
-                {"path": str(path), "exists": path.exists(), "required_for_strict_utc_to_bj": True}
-                for path in required
-            ]
-        )
+        paths = get_input_paths(ctx.config)
+        coverage, missing_core, missing_boundary_2019 = required_era5_files(paths["weather_root"])
         write_df(coverage, ctx.tables_dir / "weather_file_coverage_module02.csv")
-        if missing:
-            write_boundary_fallback_report(ctx, missing, flags)
-        build_weather_if_unblocked(ctx, flags)
+        setattr(args, "use_boundary_fallback", bool(missing_boundary_2019))
+        if missing_core:
+            add_qc(flags, MODULE, "HARD_FAIL", "era5_core_files_missing", "2020-2024 ERA5 核心文件缺失", [str(p) for p in missing_core])
+            module_exit(flags, ctx, "02", MODULE)
+            return
+        if missing_boundary_2019:
+            write_boundary_fallback_report(ctx, missing_boundary_2019, flags)
+
+        _, _, point_weights = build_spatial_weights(ctx, flags)
+        if point_weights is None:
+            module_exit(flags, ctx, "02", MODULE)
+            return
+        if args.only_weights:
+            add_qc(flags, MODULE, "INFO", "module02_only_weights", "仅生成城市-ERA5 点位与省-月点权重表，未读取 ERA5 时间序列")
+            module_exit(flags, ctx, "02", MODULE)
+            return
+        build_weather(ctx, point_weights, flags, args)
     except Exception as exc:
         add_qc(flags, MODULE, "HARD_FAIL", "module02_exception", "模块 02 执行异常", repr(exc))
     module_exit(flags, ctx, "02", MODULE)
