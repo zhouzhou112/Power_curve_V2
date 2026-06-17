@@ -78,9 +78,10 @@ Result: `syntax ok 9`.
   province-month point weights, then stream ERA5 by target year-month-variable.
   It no longer holds all 5 years x 6 variables in a `results` dictionary.
 - Module 02 now extracts ERA5 variables in parallel within each target month via
-  `ProcessPoolExecutor`. The default is `weather_parallel_workers: 2`, capped by
+  `ProcessPoolExecutor`. The default is `weather_parallel_workers: 4`, capped by
   `weather_parallel_max_workers: 4` to limit Windows NetCDF memory pressure; use
-  `--weather-workers N` for a run-specific override.
+  `--weather-workers N` for a run-specific override, including lowering
+  concurrency on memory-constrained machines.
 - Strict UTC-to-Beijing alignment ideally requires 2019 year-end ERA5 files for
   the first eight Beijing-time hours of 2020. The current implementation allows
   fallback only when `allow_2019_boundary_fallback: true`; the fallback uses the
@@ -99,10 +100,13 @@ Result: `syntax ok 9`.
   `--smoke-year 2020 --smoke-month 1` passed with no `HARD_FAIL`. The January
   2020 smoke used 9,263 ERA5 grid points, produced 23,064 province-hour rows,
   and retained only the configured 2019-boundary fallback `WARN`.
-  After enabling process parallelism, the same January 2020 all-variable smoke
-  test passed in `outputs/run_20260617_161820` with `active_workers=2` and
-  `active_mode=process_pool_variable_parallel`. Full national 2020-2024 Module
-  02 is still pending after enabling parallel extraction.
+  After enabling process parallelism, the January 2020 all-variable smoke test
+  also passed with `active_workers=4` in `outputs/run_20260617_162239`.
+- Full national 2020-2024 Module 02 completed on
+  `outputs/run_20260617_122125` with `--weather-workers 4`. QC recorded
+  `configured_workers=4`, `active_workers=4`, 60 monthly temporary weather
+  files, `weather_rows=1,359,288`, and `thermal_rows=1,359,288`. The final QC
+  has 5 `INFO`, 1 configured 2019-boundary fallback `WARN`, and 0 `HARD_FAIL`.
 
 ## Review Priorities
 

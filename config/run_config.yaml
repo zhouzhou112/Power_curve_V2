@@ -7,7 +7,7 @@ weather_root: D:/National_model/Data/ERA5/original_data
 era5_time_policy: strict_utc_to_bj
 allow_2019_boundary_fallback: true
 era5_2019_boundary_fallback_method: next_day_same_local_hour
-weather_parallel_workers: 2
+weather_parallel_workers: 4
 weather_parallel_max_workers: 4
 author_load_workbook: 2015_2024各省负荷_论文/Data output.xlsx
 power_coefficient_workbook: 各省冷热系数/Power coefficient.xlsx
