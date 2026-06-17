@@ -9,7 +9,7 @@
 本项目的目标不是重新从零预测中国省级逐小时总负荷，而是在论文公开的 2020–2024 年省级逐小时负荷数据基础上，完成四件事：
 
 1. **春节偏差校准**：对论文公开的 2020–2024 省级小时负荷曲线中春节所在月份进行偏差修正，并将修正差额按规则分配到同年其他小时，保证省级年度总电量严格不变。
-2. **冷热负荷分解**：严格复现论文的天气敏感负荷方法，使用 BAIT/HDD/CDD、南北阈值和论文给出的 `Power coefficient for heating/cooling`，计算逐省逐小时供暖与制冷负荷。空间气象加权在本项目主线中采用“城市月度用电权重”，但必须同时保留“论文人口加权口径”作为可选 baseline 或偏离说明。
+2. **冷热负荷分解**：严格复现论文的天气敏感负荷方法，使用 BAIT/HDD/CDD、省级 HDD/CDD 阈值和论文给出的 `Power coefficient for heating/cooling`，计算逐省逐小时供暖与制冷负荷。空间气象加权在本项目主线中采用“城市月度用电权重”，但必须同时保留“论文人口加权口径”作为可选 baseline 或偏离说明。
 3. **EV 负荷分解**：严格按照 `methodology_v1.md` 中广州实测校准逻辑，采用广州五类行为群体、六个环形高斯成分、96 点概率曲线、逐月单车日均充电电量和省级新能源汽车保有量，生成 2020–2024 省级 EV 充电负荷。EV 不得叠加到历史总负荷上，只作为总负荷内部拆分项。
 4. **基础残值负荷提取**：利用春节校准后的总负荷减去冷热负荷和 EV 负荷，得到 2020–2024 的基础残值负荷，并提取可用于未来 2030–2050 负荷模拟的 8760 小时基础负荷模板。
 
@@ -557,7 +557,7 @@ relative_humidity_pct = 100 * exp(
 原始 BAIT 由温度、太阳辐射、风速、湿度构造：
 
 ```text
-bait_raw_c = f(temperature_c, solar_wm2, wind_speed_ms, relative_humidity_pct)
+bait_raw_c = f(temperature_c, solar_wm2, wind_speed_ms, specific_humidity_gkg)
 ```
 
 根据论文，需考虑：
@@ -580,6 +580,7 @@ bait_raw_c = f(temperature_c, solar_wm2, wind_speed_ms, relative_humidity_pct)
 temperature_c
 dewpoint_c
 relative_humidity_pct
+specific_humidity_gkg
 wind_speed_ms
 solar_wm2
 bait_raw_c
@@ -589,23 +590,28 @@ bait_c
 
 ### 7.5 HDD/CDD阈值
 
-使用论文南北阈值：
-
-| 区域 | heat_threshold_c | cool_threshold_c |
-|---|---:|---:|
-| north | 14.713 | 22.253 |
-| south | 16.818 | 22.631 |
-
-北方省份：
+HDD/CDD 阈值不得再在代码中使用南北两个固定值。必须从 `各省冷热系数/Power coefficient.xlsx` 读取省级阈值字段：
 
 ```text
-北京、甘肃、河北、河南、黑龙江、吉林、辽宁、内蒙古、宁夏、青海、陕西、山东、山西、天津、新疆、西藏
+province_cn
+heat_threshold_c
+cool_threshold_c
 ```
 
-南方省份：
+允许字段别名包括但不限于：
 
 ```text
-其余省级区域
+T_heat / t_heat_c / heat_threshold_c / heating_threshold_c / HDD阈值 / 供暖阈值 / 采暖阈值
+T_cool / t_cool_c / cool_threshold_c / cooling_threshold_c / CDD阈值 / 制冷阈值
+```
+
+若 workbook 中没有可识别的省级阈值表，或 31 省覆盖不完整，模块 02 必须 `HARD_FAIL`，不得回退使用南北固定阈值。
+
+阈值 QC 输出：
+
+```text
+hdd_cdd_threshold_workbook_inspection.csv
+hdd_cdd_thresholds_by_province.csv
 ```
 
 小时 HDD/CDD：
@@ -614,6 +620,38 @@ bait_c
 hdd_hour = max(heat_threshold_c - bait_c, 0) / 24
 cdd_hour = max(bait_c - cool_threshold_c, 0) / 24
 ```
+
+### 7.5.1 2019 年末 ERA5 边界小时 fallback
+
+ERA5 `valid_time` 视为 UTC。严格北京时间对齐下，目标北京时间 `2020-01-01 00:00—07:00` 需要 UTC `2019-12-31 16:00—23:00`。若本地缺少 2019 年 ERA5 文件：
+
+```yaml
+allow_2019_boundary_fallback: false
+```
+
+时必须 `HARD_FAIL`。
+
+仅当配置显式设置为：
+
+```yaml
+allow_2019_boundary_fallback: true
+era5_2019_boundary_fallback_method: next_day_same_local_hour
+```
+
+才允许 fallback。fallback 规则为：目标北京时间 `2020-01-01 00:00—07:00` 使用北京时间 `2020-01-02 00:00—07:00` 的 ERA5 气象值，即 UTC `2020-01-01 16:00—23:00`。该策略保持本地日内时钟一致，避免用 UTC `2020-01-01 00:00—07:00` 即北京时间 `08:00—15:00` 替代凌晨小时。受影响记录仅 8 小时，必须在 `weather_time_alignment_qc.csv` 与 method report 中显式标记。
+
+年初 BAIT 平滑使用可用历史窗口，并按实际可用权重重新归一化。
+
+### 7.5.2 完整 Module 02 运行前门控
+
+在完整运行全国 2020—2024 前，必须先执行：
+
+```powershell
+& "C:\Users\ZZ\.conda\envs\RL\python.exe" -X utf8 scripts\02_reconstruct_weather_and_thermal_load.py --only-weights
+& "C:\Users\ZZ\.conda\envs\RL\python.exe" -X utf8 scripts\02_reconstruct_weather_and_thermal_load.py --smoke-year 2020 --smoke-month 1
+```
+
+仅当上述两个检查均无 `HARD_FAIL` 时，才允许运行全国 2020—2024 完整 Module 02。
 
 ### 7.6 Power coefficients
 
@@ -1150,6 +1188,7 @@ spring_adjusted_total_load_mw
 temperature_c
 dewpoint_c
 relative_humidity_pct
+specific_humidity_gkg
 wind_speed_ms
 solar_wm2
 bait_raw_c
@@ -1157,6 +1196,8 @@ bait_smoothed_c
 bait_c
 heat_threshold_c
 cool_threshold_c
+threshold_source_file
+threshold_source_sheet
 hdd_hour
 cdd_hour
 p_heat_gwh_per_degree_day
@@ -1173,6 +1214,10 @@ base_residual_load_mw_raw
 base_residual_load_mw_clipped
 closure_error_mw
 weather_weight_method
+humidity_method
+bait_formula
+time_alignment_method
+fallback_reference_datetime_bj
 ```
 
 ---

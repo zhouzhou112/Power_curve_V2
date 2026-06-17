@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import gc
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -12,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 from power_curve_common import (
-    NORTH_PROVINCES,
+    EXPECTED_PROVINCES,
     YEARS,
     PROJECT_ROOT,
     add_qc,
@@ -51,6 +52,37 @@ BAIT_PARAMS = {
 }
 
 REQUIRED_WEATHER_COLS = ["temperature_c", "dewpoint_c", "u10_ms", "v10_ms", "solar_wm2", "surface_pressure_pa"]
+
+HEAT_THRESHOLD_ALIASES = (
+    "heat_threshold_c",
+    "heating_threshold_c",
+    "hdd_threshold_c",
+    "t_heat",
+    "t_heat_c",
+    "heat_threshold",
+    "heating_threshold",
+    "供暖阈值",
+    "采暖阈值",
+    "供热阈值",
+    "热阈值",
+    "HDD阈值",
+)
+
+COOL_THRESHOLD_ALIASES = (
+    "cool_threshold_c",
+    "cooling_threshold_c",
+    "cdd_threshold_c",
+    "t_cool",
+    "t_cool_c",
+    "cool_threshold",
+    "cooling_threshold",
+    "制冷阈值",
+    "冷却阈值",
+    "冷阈值",
+    "CDD阈值",
+)
+
+PROVINCE_COL_ALIASES = ("province_cn", "province", "省份", "省份中文", "省", "地区", "region")
 
 
 def parse_module_args() -> argparse.Namespace:
@@ -366,9 +398,16 @@ def build_point_weights(ctx, city_weights: pd.DataFrame, mapping: pd.DataFrame, 
     )
     closure = point_weights.groupby(["province_cn", "month"], as_index=False).agg(
         point_count=("point_weight_raw", "size"),
-        contributing_grid_points=("lat_idx", "nunique"),
         point_weight_raw_sum=("point_weight_raw", "sum"),
     )
+    unique_point_count = (
+        point_weights[["province_cn", "month", "lat_idx", "lon_idx"]]
+        .drop_duplicates()
+        .groupby(["province_cn", "month"], as_index=False)
+        .size()
+        .rename(columns={"size": "contributing_grid_points"})
+    )
+    closure = closure.merge(unique_point_count, on=["province_cn", "month"], how="left")
     closure["raw_abs_error"] = closure["point_weight_raw_sum"].sub(1.0).abs()
     if (closure["point_weight_raw_sum"] <= 0).any():
         bad = closure[closure["point_weight_raw_sum"] <= 0]
@@ -382,6 +421,7 @@ def build_point_weights(ctx, city_weights: pd.DataFrame, mapping: pd.DataFrame, 
         point_weight_raw_sum=("point_weight_raw", "sum"),
         max_contributing_city_count=("contributing_city_count", "max"),
     )
+    final_closure = final_closure.merge(unique_point_count, on=["province_cn", "month"], how="left")
     final_closure["final_abs_error"] = final_closure["point_weight_sum"].sub(1.0).abs()
     final_closure["renormalized"] = final_closure["point_weight_raw_sum"].sub(1.0).abs() > 1e-6
     write_df(final_closure, ctx.tables_dir / "era5_grid_point_weight_qc.csv")
@@ -434,7 +474,7 @@ def build_spatial_weights(ctx, flags: list[dict]) -> tuple[pd.DataFrame | None, 
 def write_boundary_fallback_report(ctx, missing: list[Path], flags: list[dict]) -> None:
     text = "# Module 02 ERA5 Boundary Fallback\n\n"
     text += "ERA5 `valid_time` is interpreted as UTC. Strict Beijing-time alignment maps 2020-01-01 00:00-07:00 Beijing time to 2019-12-31 16:00-23:00 UTC.\n\n"
-    text += "The following 2019 boundary files are missing, so those first eight Beijing-time hours use the first eight available 2020 ERA5 hours as an explicit fallback. All later hours keep UTC-to-Beijing alignment.\n\n"
+    text += "The following 2019 boundary files are missing. Because `allow_2019_boundary_fallback: true`, the affected eight target hours use the next-day same-local-hour substitute: Beijing time 2020-01-02 00:00-07:00, which maps to UTC 2020-01-01 16:00-23:00. This preserves the local diurnal phase and avoids replacing early-morning hours with UTC 2020-01-01 00:00-07:00, i.e. Beijing 08:00-15:00.\n\n"
     for path in missing:
         text += f"- `{path}`\n"
     write_markdown(ctx.reports_dir / "era5_boundary_fallback_report.md", text)
@@ -443,8 +483,8 @@ def write_boundary_fallback_report(ctx, missing: list[Path], flags: list[dict]) 
         MODULE,
         "WARN",
         "era5_2019_boundary_fallback",
-        "缺少 2019 年末 ERA5 边界小时；2020 年前 8 个北京时间小时使用 2020 年首 8 个 ERA5 小时 fallback",
-        [str(p) for p in missing],
+        "缺少 2019 年末 ERA5 边界小时；按配置使用次日同本地小时替代，即北京时间 2020-01-02 00:00-07:00 对应的 UTC 2020-01-01 16:00-23:00",
+        {"missing_files": [str(p) for p in missing], "fallback_method": "next_day_same_local_hour"},
         blocking=False,
     )
 
@@ -463,11 +503,14 @@ def build_target_times(ctx, smoke_year: int | None, smoke_month: int | None, use
     times["source_datetime"] = times["datetime_bj"] - pd.Timedelta(hours=8)
     times["source_year"] = times["source_datetime"].dt.year
     times["time_alignment_method"] = "strict_utc_to_bj"
+    times["fallback_reference_datetime_bj"] = pd.NaT
     boundary_mask = times["source_year"].lt(2020)
     if boundary_mask.any() and use_boundary_fallback:
-        times.loc[boundary_mask, "source_datetime"] = times.loc[boundary_mask, "datetime_bj"]
+        fallback_reference = times.loc[boundary_mask, "datetime_bj"] + pd.Timedelta(days=1)
+        times.loc[boundary_mask, "fallback_reference_datetime_bj"] = fallback_reference
+        times.loc[boundary_mask, "source_datetime"] = fallback_reference - pd.Timedelta(hours=8)
         times.loc[boundary_mask, "source_year"] = 2020
-        times.loc[boundary_mask, "time_alignment_method"] = "fallback_2020_first_hours_for_missing_2019_boundary"
+        times.loc[boundary_mask, "time_alignment_method"] = "fallback_next_day_same_local_hour_for_missing_2019_boundary"
     times["source_year"] = times["source_year"].astype(int)
     return times
 
@@ -475,10 +518,13 @@ def build_target_times(ctx, smoke_year: int | None, smoke_month: int | None, use
 def write_time_alignment_qc(ctx, times: pd.DataFrame) -> None:
     qc = times.groupby(["time_alignment_method", "target_year", "target_month", "source_year"], as_index=False).agg(
         rows=("datetime_bj", "count"),
+        fallback_rows=("fallback_reference_datetime_bj", lambda s: int(s.notna().sum())),
         min_datetime_bj=("datetime_bj", "min"),
         max_datetime_bj=("datetime_bj", "max"),
         min_source_datetime=("source_datetime", "min"),
         max_source_datetime=("source_datetime", "max"),
+        min_fallback_reference_datetime_bj=("fallback_reference_datetime_bj", "min"),
+        max_fallback_reference_datetime_bj=("fallback_reference_datetime_bj", "max"),
     )
     write_df(qc, ctx.tables_dir / "weather_time_alignment_qc.csv")
 
@@ -551,6 +597,7 @@ def extract_month_variable(
                         "province_cn": province,
                         "datetime_bj": time_sub["datetime_bj"].to_numpy(),
                         "source_datetime": time_sub["source_datetime"].to_numpy(),
+                        "fallback_reference_datetime_bj": time_sub["fallback_reference_datetime_bj"].to_numpy(),
                         "source_year": source_year_int,
                         "time_alignment_method": time_sub["time_alignment_method"].to_numpy(),
                         out_col: values[:, point_ids].dot(point_w).astype(np.float32),
@@ -598,6 +645,139 @@ def specific_humidity_gkg(dewpoint_c: pd.Series, surface_pressure_pa: pd.Series)
     return q * 1000.0
 
 
+def normalize_header(value: Any) -> str:
+    text = "" if value is None or pd.isna(value) else str(value)
+    text = text.strip().lower()
+    text = re.sub(r"[\s_\-（）()/%℃°c]+", "", text)
+    return text
+
+
+def alias_match(value: Any, aliases: tuple[str, ...]) -> bool:
+    norm = normalize_header(value)
+    alias_norm = {normalize_header(alias) for alias in aliases}
+    return norm in alias_norm
+
+
+def find_threshold_column(row: pd.Series, aliases: tuple[str, ...]) -> int | None:
+    alias_norm = {normalize_header(alias) for alias in aliases}
+    for idx, value in row.items():
+        norm = normalize_header(value)
+        if norm in alias_norm:
+            return int(idx)
+    return None
+
+
+def find_province_column(raw: pd.DataFrame, header_row: int) -> int | None:
+    header = raw.iloc[header_row]
+    for idx, value in header.items():
+        if alias_match(value, PROVINCE_COL_ALIASES):
+            return int(idx)
+    best_col: int | None = None
+    best_count = 0
+    for col in range(raw.shape[1]):
+        values = raw.iloc[header_row + 1 :, col].map(normalize_province)
+        count = int(values.isin(EXPECTED_PROVINCES).sum())
+        if count > best_count:
+            best_col = col
+            best_count = count
+    return best_col if best_count >= 10 else None
+
+
+def read_hdd_cdd_thresholds(ctx, flags: list[dict]) -> pd.DataFrame | None:
+    path = get_input_paths(ctx.config)["power_coefficients"]
+    inspected: list[dict[str, Any]] = []
+    frames: list[pd.DataFrame] = []
+    try:
+        xl = pd.ExcelFile(path)
+        for sheet in xl.sheet_names:
+            raw = pd.read_excel(path, sheet_name=sheet, header=None, dtype=object)
+            inspected.append({"sheet": sheet, "rows": int(raw.shape[0]), "columns": int(raw.shape[1])})
+            for header_row in range(min(8, raw.shape[0])):
+                header = raw.iloc[header_row]
+                province_col = find_province_column(raw, header_row)
+                heat_col = find_threshold_column(header, HEAT_THRESHOLD_ALIASES)
+                cool_col = find_threshold_column(header, COOL_THRESHOLD_ALIASES)
+                if province_col is None or heat_col is None or cool_col is None:
+                    continue
+                candidate = raw.iloc[header_row + 1 :, [province_col, heat_col, cool_col]].copy()
+                candidate.columns = ["province_raw", "heat_threshold_c", "cool_threshold_c"]
+                candidate["province_cn"] = candidate["province_raw"].map(normalize_province)
+                candidate["heat_threshold_c"] = pd.to_numeric(candidate["heat_threshold_c"], errors="coerce")
+                candidate["cool_threshold_c"] = pd.to_numeric(candidate["cool_threshold_c"], errors="coerce")
+                candidate = candidate[
+                    candidate["province_cn"].isin(EXPECTED_PROVINCES)
+                    & candidate["heat_threshold_c"].notna()
+                    & candidate["cool_threshold_c"].notna()
+                ].copy()
+                if candidate.empty:
+                    continue
+                candidate["threshold_source_file"] = str(path)
+                candidate["threshold_source_sheet"] = sheet
+                candidate["threshold_header_row"] = int(header_row + 1)
+                frames.append(
+                    candidate[
+                        [
+                            "province_cn",
+                            "heat_threshold_c",
+                            "cool_threshold_c",
+                            "threshold_source_file",
+                            "threshold_source_sheet",
+                            "threshold_header_row",
+                        ]
+                    ]
+                )
+    except Exception as exc:
+        add_qc(flags, MODULE, "HARD_FAIL", "hdd_cdd_threshold_read_failed", "HDD/CDD 阈值表读取失败", repr(exc))
+        return None
+
+    write_df(pd.DataFrame(inspected), ctx.tables_dir / "hdd_cdd_threshold_workbook_inspection.csv")
+    if not frames:
+        add_qc(
+            flags,
+            MODULE,
+            "HARD_FAIL",
+            "hdd_cdd_threshold_missing",
+            "Power coefficient.xlsx 未发现省级 heat_threshold_c / cool_threshold_c 阈值字段；不再回退使用南北固定阈值",
+            {"expected_heat_aliases": list(HEAT_THRESHOLD_ALIASES), "expected_cool_aliases": list(COOL_THRESHOLD_ALIASES), "file": str(path)},
+        )
+        return None
+
+    thresholds = pd.concat(frames, ignore_index=True)
+    thresholds.sort_values(["province_cn", "threshold_source_sheet", "threshold_header_row"], inplace=True)
+    duplicated = thresholds[thresholds.duplicated(["province_cn"], keep=False)]
+    if not duplicated.empty:
+        write_df(duplicated, ctx.tables_dir / "hdd_cdd_threshold_duplicates.csv")
+        add_qc(
+            flags,
+            MODULE,
+            "WARN",
+            "hdd_cdd_threshold_duplicates",
+            "HDD/CDD 阈值表存在重复省份，按 workbook 顺序保留首条",
+            duplicated[["province_cn", "threshold_source_sheet", "threshold_header_row"]].to_dict("records"),
+            blocking=False,
+        )
+    thresholds = thresholds.drop_duplicates(["province_cn"], keep="first").copy()
+    missing = [province for province in EXPECTED_PROVINCES if province not in set(thresholds["province_cn"])]
+    bad_range = thresholds[
+        ~thresholds["heat_threshold_c"].between(-50, 50)
+        | ~thresholds["cool_threshold_c"].between(-50, 60)
+        | (thresholds["heat_threshold_c"] >= thresholds["cool_threshold_c"])
+    ].copy()
+    write_df(thresholds, ctx.tables_dir / "hdd_cdd_thresholds_by_province.csv")
+    if missing or not bad_range.empty:
+        add_qc(
+            flags,
+            MODULE,
+            "HARD_FAIL",
+            "hdd_cdd_threshold_invalid",
+            "HDD/CDD 省级阈值缺失或数值范围异常",
+            {"missing_provinces": missing, "bad_range": bad_range.to_dict("records")},
+        )
+        return None
+    add_qc(flags, MODULE, "INFO", "hdd_cdd_thresholds_loaded", "HDD/CDD 省级阈值已从 Power coefficient.xlsx 读取", {"provinces": int(len(thresholds))})
+    return thresholds
+
+
 def finite_exp_smooth(values: np.ndarray, window_hours: int, decay_lambda: float) -> np.ndarray:
     weights = np.exp(-decay_lambda * np.arange(window_hours + 1, dtype=float))
     valid = np.isfinite(values).astype(float)
@@ -608,7 +788,7 @@ def finite_exp_smooth(values: np.ndarray, window_hours: int, decay_lambda: float
     return out
 
 
-def add_bait_hdd_cdd(weather: pd.DataFrame) -> pd.DataFrame:
+def add_bait_hdd_cdd(weather: pd.DataFrame, thresholds: pd.DataFrame) -> pd.DataFrame:
     weather = weather.sort_values(["province_cn", "datetime_bj"]).copy()
     weather["relative_humidity_pct"] = relative_humidity_from_dewpoint(weather["temperature_c"], weather["dewpoint_c"])
     weather["specific_humidity_gkg"] = specific_humidity_gkg(weather["dewpoint_c"], weather["surface_pressure_pa"])
@@ -646,9 +826,22 @@ def add_bait_hdd_cdd(weather: pd.DataFrame) -> pd.DataFrame:
     )
     weather["bait_blend_factor"] = 0.5 / (1.0 + np.exp(-weather["bait_blend_k"]))
     weather["bait_c"] = weather["bait_smoothed_c"] * (1.0 - weather["bait_blend_factor"]) + weather["temperature_c"] * weather["bait_blend_factor"]
-    weather["region"] = np.where(weather["province_cn"].isin(NORTH_PROVINCES), "north", "south")
-    weather["heat_threshold_c"] = np.where(weather["region"].eq("north"), 14.713, 16.818)
-    weather["cool_threshold_c"] = np.where(weather["region"].eq("north"), 22.253, 22.631)
+    weather = weather.merge(
+        thresholds[
+            [
+                "province_cn",
+                "heat_threshold_c",
+                "cool_threshold_c",
+                "threshold_source_file",
+                "threshold_source_sheet",
+            ]
+        ],
+        on="province_cn",
+        how="left",
+    )
+    if weather[["heat_threshold_c", "cool_threshold_c"]].isna().any().any():
+        missing = weather.loc[weather[["heat_threshold_c", "cool_threshold_c"]].isna().any(axis=1), "province_cn"].drop_duplicates().tolist()
+        raise ValueError(f"weather rows missing HDD/CDD thresholds: {missing}")
     weather["hdd_hour"] = np.maximum(weather["heat_threshold_c"] - weather["bait_c"], 0.0) / 24.0
     weather["cdd_hour"] = np.maximum(weather["bait_c"] - weather["cool_threshold_c"], 0.0) / 24.0
     weather["weather_weight_method"] = "city_monthly_electricity_era5_grid_points"
@@ -670,6 +863,9 @@ def write_weather_qc(ctx, weather: pd.DataFrame, thermal: pd.DataFrame) -> None:
     )
     write_df(unit_qc, ctx.tables_dir / "weather_variable_unit_qc.csv")
     bait_qc = weather.groupby(["province_cn", "year"], as_index=False).agg(
+        heat_threshold_c=("heat_threshold_c", "first"),
+        cool_threshold_c=("cool_threshold_c", "first"),
+        threshold_source_sheet=("threshold_source_sheet", "first"),
         temperature_min_c=("temperature_c", "min"),
         temperature_max_c=("temperature_c", "max"),
         rh_min_pct=("relative_humidity_pct", "min"),
@@ -737,12 +933,20 @@ province series.
 Temperature blending uses `B = 0.5/(1+exp(-kB))`, with `B_L=15 C` and
 `B_U=23 C`, then `BAIT = sBAIT*(1-B) + T*B`.
 
-HDD/CDD thresholds use the reset-plan north/south values:
+## HDD/CDD Thresholds
 
-```text
-north: heat_threshold_c = 14.713, cool_threshold_c = 22.253
-south: heat_threshold_c = 16.818, cool_threshold_c = 22.631
-```
+`heat_threshold_c` and `cool_threshold_c` are read from
+`各省冷热系数/Power coefficient.xlsx`. The module no longer falls back to the
+old north/south constants. If the workbook does not contain province-level
+threshold fields, Module 02 records `hdd_cdd_threshold_missing` as a `HARD_FAIL`.
+
+## 2019 Boundary Fallback
+
+When 2019 year-end ERA5 files are missing, fallback is allowed only if
+`allow_2019_boundary_fallback: true` is set in `config/run_config.yaml`. The
+fallback method is `next_day_same_local_hour`: target Beijing-time
+2020-01-01 00:00-07:00 uses the ERA5 values for Beijing-time
+2020-01-02 00:00-07:00, corresponding to UTC 2020-01-01 16:00-23:00.
 """
     write_markdown(ctx.reports_dir / "method_report_module02.md", text)
 
@@ -750,7 +954,19 @@ south: heat_threshold_c = 16.818, cool_threshold_c = 22.631
 def merge_month_variable_frames(var_frames: list[pd.DataFrame]) -> pd.DataFrame:
     base = var_frames[0]
     for part in var_frames[1:]:
-        value_cols = [col for col in part.columns if col not in {"province_cn", "datetime_bj", "source_datetime", "source_year", "time_alignment_method"}]
+        value_cols = [
+            col
+            for col in part.columns
+            if col
+            not in {
+                "province_cn",
+                "datetime_bj",
+                "source_datetime",
+                "fallback_reference_datetime_bj",
+                "source_year",
+                "time_alignment_method",
+            }
+        ]
         base = base.merge(part[["province_cn", "datetime_bj"] + value_cols], on=["province_cn", "datetime_bj"], how="left")
     return base
 
@@ -775,6 +991,12 @@ def build_weather(ctx, point_weights: pd.DataFrame, flags: list[dict], args: arg
             return
 
     variables = [args.smoke_variable] if args.smoke_variable else list(ERA5_SPECS)
+    thresholds = None
+    if not args.smoke_variable:
+        write_method_report(ctx)
+        thresholds = read_hdd_cdd_thresholds(ctx, flags)
+        if thresholds is None:
+            return
     max_workers = int(ctx.config.get("weather_parallel_workers", 1))
     capped_workers = max(1, min(max_workers, 2))
     add_qc(
@@ -818,14 +1040,22 @@ def build_weather(ctx, point_weights: pd.DataFrame, flags: list[dict], args: arg
         gc.collect()
 
     raw_weather = pd.concat(
-        (pd.read_csv(path, compression="gzip", encoding="utf-8-sig", parse_dates=["datetime_bj", "source_datetime"]) for path in tmp_files),
+        (
+            pd.read_csv(
+                path,
+                compression="gzip",
+                encoding="utf-8-sig",
+                parse_dates=["datetime_bj", "source_datetime", "fallback_reference_datetime_bj"],
+            )
+            for path in tmp_files
+        ),
         ignore_index=True,
     )
     missing = [col for col in REQUIRED_WEATHER_COLS if col not in raw_weather.columns or raw_weather[col].isna().any()]
     if missing:
         add_qc(flags, MODULE, "HARD_FAIL", "weather_required_columns_missing", "BAIT 所需 ERA5 变量缺失或存在空值", missing)
         return
-    weather = add_bait_hdd_cdd(raw_weather)
+    weather = add_bait_hdd_cdd(raw_weather, thresholds)
     coeff = read_power_coefficients(ctx)
     thermal = weather.merge(
         coeff[["province_cn", "year", "p_heat_gwh_per_degree_day", "p_cool_gwh_per_degree_day"]],
@@ -848,6 +1078,7 @@ def build_weather(ctx, point_weights: pd.DataFrame, flags: list[dict], args: arg
         "year",
         "month",
         "source_datetime",
+        "fallback_reference_datetime_bj",
         "source_year",
         "time_alignment_method",
         "weather_weight_method",
@@ -872,6 +1103,8 @@ def build_weather(ctx, point_weights: pd.DataFrame, flags: list[dict], args: arg
         "bait_c",
         "heat_threshold_c",
         "cool_threshold_c",
+        "threshold_source_file",
+        "threshold_source_sheet",
         "hdd_hour",
         "cdd_hour",
     ]
@@ -898,12 +1131,24 @@ def main() -> None:
         paths = get_input_paths(ctx.config)
         coverage, missing_core, missing_boundary_2019 = required_era5_files(paths["weather_root"])
         write_df(coverage, ctx.tables_dir / "weather_file_coverage_module02.csv")
-        setattr(args, "use_boundary_fallback", bool(missing_boundary_2019))
         if missing_core:
             add_qc(flags, MODULE, "HARD_FAIL", "era5_core_files_missing", "2020-2024 ERA5 核心文件缺失", [str(p) for p in missing_core])
             module_exit(flags, ctx, "02", MODULE)
             return
+        allow_boundary_fallback = bool(ctx.config.get("allow_2019_boundary_fallback", False))
+        setattr(args, "use_boundary_fallback", bool(missing_boundary_2019 and allow_boundary_fallback))
         if missing_boundary_2019:
+            if not allow_boundary_fallback:
+                add_qc(
+                    flags,
+                    MODULE,
+                    "HARD_FAIL",
+                    "era5_2019_boundary_missing_fallback_disabled",
+                    "缺少 2019 年末 ERA5 边界小时，且 allow_2019_boundary_fallback=false",
+                    [str(p) for p in missing_boundary_2019],
+                )
+                module_exit(flags, ctx, "02", MODULE)
+                return
             write_boundary_fallback_report(ctx, missing_boundary_2019, flags)
 
         _, _, point_weights = build_spatial_weights(ctx, flags)

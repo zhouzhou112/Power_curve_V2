@@ -8,8 +8,12 @@ BAIT, HDD/CDD, and heating/cooling load reconstruction.
 - The module does not extend the historical load period beyond 2020-2024.
 - ERA5 `valid_time` is treated as UTC and aligned to Beijing time by subtracting
   8 hours from each target Beijing timestamp.
-- If 2019 year-end ERA5 boundary files are absent, the first 8 Beijing-time
-  hours of 2020 use an explicit 2020-boundary fallback and record a QC warning.
+- If 2019 year-end ERA5 boundary files are absent, fallback is allowed only when
+  `allow_2019_boundary_fallback: true` is set. The fallback method is
+  `next_day_same_local_hour`: Beijing-time 2020-01-01 00:00-07:00 uses ERA5
+  values for Beijing-time 2020-01-02 00:00-07:00, corresponding to UTC
+  2020-01-01 16:00-23:00. This avoids replacing early-morning local hours with
+  UTC 2020-01-01 00:00-07:00, i.e. Beijing 08:00-15:00.
 - Guangdong and Hainan actual load data remain validation-only and are not used.
 
 ## Spatial Weighting
@@ -60,9 +64,19 @@ kH = exp(1 + 0.06*T)
 temperature and surface pressure as hourly specific humidity in `g/kg`; relative
 humidity is retained only as a QC diagnostic.
 
-The north/south HDD/CDD thresholds remain those documented in the reset plan:
+HDD/CDD thresholds are read from `各省冷热系数/Power coefficient.xlsx`.
+The module no longer falls back to the old north/south constants. If the
+workbook does not contain province-level `heat_threshold_c` and
+`cool_threshold_c` fields, Module 02 records `hdd_cdd_threshold_missing` as a
+`HARD_FAIL`.
 
-```text
-north: heat 14.713 C, cool 22.253 C
-south: heat 16.818 C, cool 22.631 C
+## Run Gate Before Full Module 02
+
+Before running national 2020-2024 Module 02, execute:
+
+```powershell
+& "C:\Users\ZZ\.conda\envs\RL\python.exe" -X utf8 scripts\02_reconstruct_weather_and_thermal_load.py --only-weights
+& "C:\Users\ZZ\.conda\envs\RL\python.exe" -X utf8 scripts\02_reconstruct_weather_and_thermal_load.py --smoke-year 2020 --smoke-month 1
 ```
+
+Only run full Module 02 if both checks complete without `HARD_FAIL`.

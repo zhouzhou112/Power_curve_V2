@@ -80,16 +80,24 @@ Result: `syntax ok 9`.
 - Module 02 defaults to single-worker ERA5 reading, capped at 2 if parallel
   reading is enabled later. This avoids local Windows NetCDF I/O contention.
 - Strict UTC-to-Beijing alignment ideally requires 2019 year-end ERA5 files for
-  the first eight Beijing-time hours of 2020. The current implementation records
-  a `WARN` and applies an explicit eight-hour boundary fallback to 2020 ERA5
-  hours if those 2019 files are absent.
+  the first eight Beijing-time hours of 2020. The current implementation allows
+  fallback only when `allow_2019_boundary_fallback: true`; the fallback uses the
+  next-day same-local-hour substitute, i.e. Beijing-time 2020-01-02 00:00-07:00
+  for target 2020-01-01 00:00-07:00.
 - BAIT is now implemented from the specified Eq.(4)-Eq.(11) structure, including
   specific humidity from dewpoint plus surface pressure and a finite 48-hour
   exponential window. The older transparent approximation is no longer used as
   the main result.
-- Local smoke tests passed for Module 02: `--only-weights`,
-  `--smoke-province 广东 --smoke-year 2020 --smoke-month 1 --smoke-variable t2m`,
-  and `--smoke-province 广东 --smoke-year 2020 --smoke-month 1`.
+- Module 02 no longer uses the old north/south HDD/CDD fixed thresholds. It
+  requires province-level `heat_threshold_c` and `cool_threshold_c` fields in
+  `各省冷热系数/Power coefficient.xlsx`; otherwise it records a `HARD_FAIL`.
+- Latest Module 02 gate status: `--only-weights` passes. National
+  `--smoke-year 2020 --smoke-month 1` stops with `HARD_FAIL`
+  `hdd_cdd_threshold_missing` because the current local
+  `各省冷热系数/Power coefficient.xlsx` contains only visible
+  `Power coefficient for heating` and `Power coefficient for cooling` sheets,
+  with no province-level HDD/CDD threshold fields. Full national 2020-2024
+  Module 02 has not been run after this stricter threshold gate.
 
 ## Review Priorities
 
