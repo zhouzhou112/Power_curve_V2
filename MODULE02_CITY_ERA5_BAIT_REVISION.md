@@ -64,11 +64,17 @@ kH = exp(1 + 0.06*T)
 temperature and surface pressure as hourly specific humidity in `g/kg`; relative
 humidity is retained only as a QC diagnostic.
 
-HDD/CDD thresholds are read from `各省冷热系数/Power coefficient.xlsx`.
-The module no longer falls back to the old north/south constants. If the
-workbook does not contain province-level `heat_threshold_c` and
-`cool_threshold_c` fields, Module 02 records `hdd_cdd_threshold_missing` as a
-`HARD_FAIL`.
+HDD/CDD thresholds use the requested central-heating north/south rule:
+
+```text
+north: heat_threshold_c = 14.713, cool_threshold_c = 22.253
+south: heat_threshold_c = 16.818, cool_threshold_c = 22.631
+```
+
+The north group contains 16 provinces: Beijing, Gansu, Hebei, Henan,
+Heilongjiang, Jilin, Liaoning, Inner Mongolia, Ningxia, Qinghai, Shaanxi,
+Shandong, Shanxi, Tianjin, Xinjiang, and Tibet. The south group contains the
+remaining 15 provinces.
 
 ## Run Gate Before Full Module 02
 

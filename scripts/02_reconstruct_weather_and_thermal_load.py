@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import gc
 import os
-import re
 import time
 from pathlib import Path
 from typing import Any
@@ -53,36 +52,29 @@ BAIT_PARAMS = {
 
 REQUIRED_WEATHER_COLS = ["temperature_c", "dewpoint_c", "u10_ms", "v10_ms", "solar_wm2", "surface_pressure_pa"]
 
-HEAT_THRESHOLD_ALIASES = (
-    "heat_threshold_c",
-    "heating_threshold_c",
-    "hdd_threshold_c",
-    "t_heat",
-    "t_heat_c",
-    "heat_threshold",
-    "heating_threshold",
-    "供暖阈值",
-    "采暖阈值",
-    "供热阈值",
-    "热阈值",
-    "HDD阈值",
-)
+NORTH_HEATING_PROVINCES = {
+    "北京",
+    "甘肃",
+    "河北",
+    "河南",
+    "黑龙江",
+    "吉林",
+    "辽宁",
+    "内蒙古",
+    "宁夏",
+    "青海",
+    "陕西",
+    "山东",
+    "山西",
+    "天津",
+    "新疆",
+    "西藏",
+}
 
-COOL_THRESHOLD_ALIASES = (
-    "cool_threshold_c",
-    "cooling_threshold_c",
-    "cdd_threshold_c",
-    "t_cool",
-    "t_cool_c",
-    "cool_threshold",
-    "cooling_threshold",
-    "制冷阈值",
-    "冷却阈值",
-    "冷阈值",
-    "CDD阈值",
-)
-
-PROVINCE_COL_ALIASES = ("province_cn", "province", "省份", "省份中文", "省", "地区", "region")
+THRESHOLD_VALUES = {
+    "north": {"heat_threshold_c": 14.713, "cool_threshold_c": 22.253},
+    "south": {"heat_threshold_c": 16.818, "cool_threshold_c": 22.631},
+}
 
 
 def parse_module_args() -> argparse.Namespace:
@@ -645,136 +637,34 @@ def specific_humidity_gkg(dewpoint_c: pd.Series, surface_pressure_pa: pd.Series)
     return q * 1000.0
 
 
-def normalize_header(value: Any) -> str:
-    text = "" if value is None or pd.isna(value) else str(value)
-    text = text.strip().lower()
-    text = re.sub(r"[\s_\-（）()/%℃°c]+", "", text)
-    return text
-
-
-def alias_match(value: Any, aliases: tuple[str, ...]) -> bool:
-    norm = normalize_header(value)
-    alias_norm = {normalize_header(alias) for alias in aliases}
-    return norm in alias_norm
-
-
-def find_threshold_column(row: pd.Series, aliases: tuple[str, ...]) -> int | None:
-    alias_norm = {normalize_header(alias) for alias in aliases}
-    for idx, value in row.items():
-        norm = normalize_header(value)
-        if norm in alias_norm:
-            return int(idx)
-    return None
-
-
-def find_province_column(raw: pd.DataFrame, header_row: int) -> int | None:
-    header = raw.iloc[header_row]
-    for idx, value in header.items():
-        if alias_match(value, PROVINCE_COL_ALIASES):
-            return int(idx)
-    best_col: int | None = None
-    best_count = 0
-    for col in range(raw.shape[1]):
-        values = raw.iloc[header_row + 1 :, col].map(normalize_province)
-        count = int(values.isin(EXPECTED_PROVINCES).sum())
-        if count > best_count:
-            best_col = col
-            best_count = count
-    return best_col if best_count >= 10 else None
-
-
-def read_hdd_cdd_thresholds(ctx, flags: list[dict]) -> pd.DataFrame | None:
-    path = get_input_paths(ctx.config)["power_coefficients"]
-    inspected: list[dict[str, Any]] = []
-    frames: list[pd.DataFrame] = []
-    try:
-        xl = pd.ExcelFile(path)
-        for sheet in xl.sheet_names:
-            raw = pd.read_excel(path, sheet_name=sheet, header=None, dtype=object)
-            inspected.append({"sheet": sheet, "rows": int(raw.shape[0]), "columns": int(raw.shape[1])})
-            for header_row in range(min(8, raw.shape[0])):
-                header = raw.iloc[header_row]
-                province_col = find_province_column(raw, header_row)
-                heat_col = find_threshold_column(header, HEAT_THRESHOLD_ALIASES)
-                cool_col = find_threshold_column(header, COOL_THRESHOLD_ALIASES)
-                if province_col is None or heat_col is None or cool_col is None:
-                    continue
-                candidate = raw.iloc[header_row + 1 :, [province_col, heat_col, cool_col]].copy()
-                candidate.columns = ["province_raw", "heat_threshold_c", "cool_threshold_c"]
-                candidate["province_cn"] = candidate["province_raw"].map(normalize_province)
-                candidate["heat_threshold_c"] = pd.to_numeric(candidate["heat_threshold_c"], errors="coerce")
-                candidate["cool_threshold_c"] = pd.to_numeric(candidate["cool_threshold_c"], errors="coerce")
-                candidate = candidate[
-                    candidate["province_cn"].isin(EXPECTED_PROVINCES)
-                    & candidate["heat_threshold_c"].notna()
-                    & candidate["cool_threshold_c"].notna()
-                ].copy()
-                if candidate.empty:
-                    continue
-                candidate["threshold_source_file"] = str(path)
-                candidate["threshold_source_sheet"] = sheet
-                candidate["threshold_header_row"] = int(header_row + 1)
-                frames.append(
-                    candidate[
-                        [
-                            "province_cn",
-                            "heat_threshold_c",
-                            "cool_threshold_c",
-                            "threshold_source_file",
-                            "threshold_source_sheet",
-                            "threshold_header_row",
-                        ]
-                    ]
-                )
-    except Exception as exc:
-        add_qc(flags, MODULE, "HARD_FAIL", "hdd_cdd_threshold_read_failed", "HDD/CDD 阈值表读取失败", repr(exc))
-        return None
-
-    write_df(pd.DataFrame(inspected), ctx.tables_dir / "hdd_cdd_threshold_workbook_inspection.csv")
-    if not frames:
-        add_qc(
-            flags,
-            MODULE,
-            "HARD_FAIL",
-            "hdd_cdd_threshold_missing",
-            "Power coefficient.xlsx 未发现省级 heat_threshold_c / cool_threshold_c 阈值字段；不再回退使用南北固定阈值",
-            {"expected_heat_aliases": list(HEAT_THRESHOLD_ALIASES), "expected_cool_aliases": list(COOL_THRESHOLD_ALIASES), "file": str(path)},
+def build_hdd_cdd_thresholds(ctx, flags: list[dict]) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for province in EXPECTED_PROVINCES:
+        region = "north" if province in NORTH_HEATING_PROVINCES else "south"
+        rows.append(
+            {
+                "province_cn": province,
+                "thermal_region": region,
+                "heat_threshold_c": THRESHOLD_VALUES[region]["heat_threshold_c"],
+                "cool_threshold_c": THRESHOLD_VALUES[region]["cool_threshold_c"],
+                "threshold_source_file": "codex_power_curve_v2_reset_plan.md",
+                "threshold_source_sheet": "central_heating_16_province_north_south_rule",
+            }
         )
-        return None
-
-    thresholds = pd.concat(frames, ignore_index=True)
-    thresholds.sort_values(["province_cn", "threshold_source_sheet", "threshold_header_row"], inplace=True)
-    duplicated = thresholds[thresholds.duplicated(["province_cn"], keep=False)]
-    if not duplicated.empty:
-        write_df(duplicated, ctx.tables_dir / "hdd_cdd_threshold_duplicates.csv")
-        add_qc(
-            flags,
-            MODULE,
-            "WARN",
-            "hdd_cdd_threshold_duplicates",
-            "HDD/CDD 阈值表存在重复省份，按 workbook 顺序保留首条",
-            duplicated[["province_cn", "threshold_source_sheet", "threshold_header_row"]].to_dict("records"),
-            blocking=False,
-        )
-    thresholds = thresholds.drop_duplicates(["province_cn"], keep="first").copy()
-    missing = [province for province in EXPECTED_PROVINCES if province not in set(thresholds["province_cn"])]
-    bad_range = thresholds[
-        ~thresholds["heat_threshold_c"].between(-50, 50)
-        | ~thresholds["cool_threshold_c"].between(-50, 60)
-        | (thresholds["heat_threshold_c"] >= thresholds["cool_threshold_c"])
-    ].copy()
+    thresholds = pd.DataFrame(rows)
     write_df(thresholds, ctx.tables_dir / "hdd_cdd_thresholds_by_province.csv")
-    if missing or not bad_range.empty:
-        add_qc(
-            flags,
-            MODULE,
-            "HARD_FAIL",
-            "hdd_cdd_threshold_invalid",
-            "HDD/CDD 省级阈值缺失或数值范围异常",
-            {"missing_provinces": missing, "bad_range": bad_range.to_dict("records")},
-        )
-        return None
-    add_qc(flags, MODULE, "INFO", "hdd_cdd_thresholds_loaded", "HDD/CDD 省级阈值已从 Power coefficient.xlsx 读取", {"provinces": int(len(thresholds))})
+    summary = thresholds.groupby("thermal_region", as_index=False).agg(
+        province_count=("province_cn", "nunique"),
+        heat_threshold_c=("heat_threshold_c", "first"),
+        cool_threshold_c=("cool_threshold_c", "first"),
+        provinces=("province_cn", lambda s: ";".join(s)),
+    )
+    write_df(summary, ctx.tables_dir / "hdd_cdd_threshold_region_qc.csv")
+    counts = summary.set_index("thermal_region")["province_count"].to_dict()
+    if counts.get("north") != 16 or counts.get("south") != 15:
+        add_qc(flags, MODULE, "HARD_FAIL", "hdd_cdd_threshold_region_count", "HDD/CDD 南北分区省份数量不符合 16/15", counts)
+    else:
+        add_qc(flags, MODULE, "INFO", "hdd_cdd_thresholds_loaded", "HDD/CDD 阈值按集中供暖 16 省 north / 其余 15 省 south 规则生成", counts)
     return thresholds
 
 
@@ -830,6 +720,7 @@ def add_bait_hdd_cdd(weather: pd.DataFrame, thresholds: pd.DataFrame) -> pd.Data
         thresholds[
             [
                 "province_cn",
+                "thermal_region",
                 "heat_threshold_c",
                 "cool_threshold_c",
                 "threshold_source_file",
@@ -866,6 +757,7 @@ def write_weather_qc(ctx, weather: pd.DataFrame, thermal: pd.DataFrame) -> None:
         heat_threshold_c=("heat_threshold_c", "first"),
         cool_threshold_c=("cool_threshold_c", "first"),
         threshold_source_sheet=("threshold_source_sheet", "first"),
+        thermal_region=("thermal_region", "first"),
         temperature_min_c=("temperature_c", "min"),
         temperature_max_c=("temperature_c", "max"),
         rh_min_pct=("relative_humidity_pct", "min"),
@@ -935,10 +827,15 @@ Temperature blending uses `B = 0.5/(1+exp(-kB))`, with `B_L=15 C` and
 
 ## HDD/CDD Thresholds
 
-`heat_threshold_c` and `cool_threshold_c` are read from
-`各省冷热系数/Power coefficient.xlsx`. The module no longer falls back to the
-old north/south constants. If the workbook does not contain province-level
-threshold fields, Module 02 records `hdd_cdd_threshold_missing` as a `HARD_FAIL`.
+HDD/CDD thresholds use the central-heating north/south rule requested for this
+run. The 16 north provinces are Beijing, Gansu, Hebei, Henan, Heilongjiang,
+Jilin, Liaoning, Inner Mongolia, Ningxia, Qinghai, Shaanxi, Shandong, Shanxi,
+Tianjin, Xinjiang, and Tibet. The remaining 15 provinces are south.
+
+```text
+north: heat_threshold_c = 14.713, cool_threshold_c = 22.253
+south: heat_threshold_c = 16.818, cool_threshold_c = 22.631
+```
 
 ## 2019 Boundary Fallback
 
@@ -994,9 +891,7 @@ def build_weather(ctx, point_weights: pd.DataFrame, flags: list[dict], args: arg
     thresholds = None
     if not args.smoke_variable:
         write_method_report(ctx)
-        thresholds = read_hdd_cdd_thresholds(ctx, flags)
-        if thresholds is None:
-            return
+        thresholds = build_hdd_cdd_thresholds(ctx, flags)
     max_workers = int(ctx.config.get("weather_parallel_workers", 1))
     capped_workers = max(1, min(max_workers, 2))
     add_qc(
@@ -1084,6 +979,7 @@ def build_weather(ctx, point_weights: pd.DataFrame, flags: list[dict], args: arg
         "weather_weight_method",
         "humidity_method",
         "bait_formula",
+        "thermal_region",
         "temperature_c",
         "dewpoint_c",
         "relative_humidity_pct",

@@ -88,16 +88,17 @@ Result: `syntax ok 9`.
   specific humidity from dewpoint plus surface pressure and a finite 48-hour
   exponential window. The older transparent approximation is no longer used as
   the main result.
-- Module 02 no longer uses the old north/south HDD/CDD fixed thresholds. It
-  requires province-level `heat_threshold_c` and `cool_threshold_c` fields in
-  `各省冷热系数/Power coefficient.xlsx`; otherwise it records a `HARD_FAIL`.
-- Latest Module 02 gate status: `--only-weights` passes. National
-  `--smoke-year 2020 --smoke-month 1` stops with `HARD_FAIL`
-  `hdd_cdd_threshold_missing` because the current local
-  `各省冷热系数/Power coefficient.xlsx` contains only visible
-  `Power coefficient for heating` and `Power coefficient for cooling` sheets,
-  with no province-level HDD/CDD threshold fields. Full national 2020-2024
-  Module 02 has not been run after this stricter threshold gate.
+- Module 02 uses the requested central-heating north/south HDD/CDD thresholds:
+  north is the 16 concentrated-heating provinces, south is the remaining 15
+  provinces. The thresholds are `north: 14.713/22.253` and
+  `south: 16.818/22.631` for heat/cool respectively.
+- Latest Module 02 gate status after the threshold correction:
+  `--only-weights` passed, and national
+  `--smoke-year 2020 --smoke-month 1` passed with no `HARD_FAIL`. The January
+  2020 smoke used 9,263 ERA5 grid points, produced 23,064 province-hour rows,
+  and retained only the configured 2019-boundary fallback `WARN`.
+  Full national 2020-2024 Module 02 has not been run in this turn because the
+  smoke runtime implies a multi-hour full extraction.
 
 ## Review Priorities
 

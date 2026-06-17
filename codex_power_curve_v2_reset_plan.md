@@ -9,7 +9,7 @@
 本项目的目标不是重新从零预测中国省级逐小时总负荷，而是在论文公开的 2020–2024 年省级逐小时负荷数据基础上，完成四件事：
 
 1. **春节偏差校准**：对论文公开的 2020–2024 省级小时负荷曲线中春节所在月份进行偏差修正，并将修正差额按规则分配到同年其他小时，保证省级年度总电量严格不变。
-2. **冷热负荷分解**：严格复现论文的天气敏感负荷方法，使用 BAIT/HDD/CDD、省级 HDD/CDD 阈值和论文给出的 `Power coefficient for heating/cooling`，计算逐省逐小时供暖与制冷负荷。空间气象加权在本项目主线中采用“城市月度用电权重”，但必须同时保留“论文人口加权口径”作为可选 baseline 或偏离说明。
+2. **冷热负荷分解**：严格复现论文的天气敏感负荷方法，使用 BAIT/HDD/CDD、集中供暖省份南北阈值和论文给出的 `Power coefficient for heating/cooling`，计算逐省逐小时供暖与制冷负荷。空间气象加权在本项目主线中采用“城市月度用电权重”，但必须同时保留“论文人口加权口径”作为可选 baseline 或偏离说明。
 3. **EV 负荷分解**：严格按照 `methodology_v1.md` 中广州实测校准逻辑，采用广州五类行为群体、六个环形高斯成分、96 点概率曲线、逐月单车日均充电电量和省级新能源汽车保有量，生成 2020–2024 省级 EV 充电负荷。EV 不得叠加到历史总负荷上，只作为总负荷内部拆分项。
 4. **基础残值负荷提取**：利用春节校准后的总负荷减去冷热负荷和 EV 负荷，得到 2020–2024 的基础残值负荷，并提取可用于未来 2030–2050 负荷模拟的 8760 小时基础负荷模板。
 
@@ -590,28 +590,26 @@ bait_c
 
 ### 7.5 HDD/CDD阈值
 
-HDD/CDD 阈值不得再在代码中使用南北两个固定值。必须从 `各省冷热系数/Power coefficient.xlsx` 读取省级阈值字段：
+HDD/CDD 阈值按集中供暖省份划分为 north / south 两组，不从 `Power coefficient.xlsx` 读取省级阈值字段。
 
 ```text
-province_cn
-heat_threshold_c
-cool_threshold_c
+north: heat_threshold_c = 14.713, cool_threshold_c = 22.253
+south: heat_threshold_c = 16.818, cool_threshold_c = 22.631
 ```
 
-允许字段别名包括但不限于：
+北方 16 个省份：
 
 ```text
-T_heat / t_heat_c / heat_threshold_c / heating_threshold_c / HDD阈值 / 供暖阈值 / 采暖阈值
-T_cool / t_cool_c / cool_threshold_c / cooling_threshold_c / CDD阈值 / 制冷阈值
+北京、甘肃、河北、河南、黑龙江、吉林、辽宁、内蒙古、宁夏、青海、陕西、山东、山西、天津、新疆、西藏
 ```
 
-若 workbook 中没有可识别的省级阈值表，或 31 省覆盖不完整，模块 02 必须 `HARD_FAIL`，不得回退使用南北固定阈值。
+南方 15 个省份为其余省份。
 
 阈值 QC 输出：
 
 ```text
-hdd_cdd_threshold_workbook_inspection.csv
 hdd_cdd_thresholds_by_province.csv
+hdd_cdd_threshold_region_qc.csv
 ```
 
 小时 HDD/CDD：
@@ -1194,6 +1192,7 @@ solar_wm2
 bait_raw_c
 bait_smoothed_c
 bait_c
+thermal_region
 heat_threshold_c
 cool_threshold_c
 threshold_source_file
