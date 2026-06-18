@@ -6,6 +6,7 @@ from pathlib import Path
 import matplotlib
 
 matplotlib.use("Agg")
+from matplotlib import font_manager as fm
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -14,6 +15,44 @@ from power_curve_common import add_qc, init_context, module_exit, parse_args, re
 
 
 MODULE = "06_figures_and_reports"
+
+CJK_FONT_CANDIDATES = [
+    ("SimHei", Path("C:/Windows/Fonts/simhei.ttf")),
+    ("Microsoft YaHei", Path("C:/Windows/Fonts/msyh.ttc")),
+    ("SimSun", Path("C:/Windows/Fonts/simsun.ttc")),
+    ("Noto Sans SC", Path("C:/Windows/Fonts/NotoSansSC-VF.ttf")),
+]
+
+
+def configure_matplotlib_fonts(flags: list[dict]) -> None:
+    for font_name, font_path in CJK_FONT_CANDIDATES:
+        if font_path.exists():
+            fm.fontManager.addfont(str(font_path))
+            plt.rcParams["font.family"] = "sans-serif"
+            plt.rcParams["font.sans-serif"] = [font_name, "DejaVu Sans"]
+            plt.rcParams["axes.unicode_minus"] = False
+            plt.rcParams["pdf.fonttype"] = 42
+            plt.rcParams["ps.fonttype"] = 42
+            add_qc(
+                flags,
+                MODULE,
+                "INFO",
+                "figure_font_configured",
+                "Module 06 figures use an explicit CJK-capable font",
+                {"font": font_name, "path": str(font_path)},
+                blocking=False,
+            )
+            return
+    plt.rcParams["axes.unicode_minus"] = False
+    add_qc(
+        flags,
+        MODULE,
+        "WARN",
+        "figure_cjk_font_missing",
+        "No configured CJK font was found; figure labels may miss Chinese glyphs",
+        {"candidates": [str(path) for _, path in CJK_FONT_CANDIDATES]},
+        blocking=False,
+    )
 
 
 def load_optional(ctx, filename: str, **kwargs) -> pd.DataFrame | None:
@@ -46,10 +85,148 @@ def simple_bar(ctx, name: str, data: pd.DataFrame, x: str, y: str, title: str, y
     save_figure(ctx, name, fig, plot)
 
 
+def add_assessment(rows: list[dict], stage: str, metric: str, value, reference: str, decision: str, note: str) -> None:
+    rows.append(
+        {
+            "stage": stage,
+            "metric": metric,
+            "value": value,
+            "reference": reference,
+            "decision": decision,
+            "note": note,
+        }
+    )
+
+
+def compact_value(value) -> str:
+    if pd.isna(value):
+        return ""
+    if isinstance(value, float):
+        return f"{value:.6g}"
+    return str(value)
+
+
+def markdown_table(df: pd.DataFrame) -> str:
+    cols = list(df.columns)
+    lines = [
+        "| " + " | ".join(cols) + " |",
+        "| " + " | ".join(["---"] * len(cols)) + " |",
+    ]
+    for _, row in df.iterrows():
+        lines.append("| " + " | ".join(str(row[col]).replace("\n", " ") for col in cols) + " |")
+    return "\n".join(lines)
+
+
+def write_error_assessment(
+    ctx,
+    current_flags: list[dict],
+    actual: pd.DataFrame | None,
+    actual_monthly: pd.DataFrame | None,
+    actual_shape: pd.DataFrame | None,
+    actual_peak: pd.DataFrame | None,
+    base_qc: pd.DataFrame | None,
+    template: pd.DataFrame | None,
+) -> None:
+    rows: list[dict] = []
+    for module_number in range(7):
+        if module_number == 6:
+            qc = pd.DataFrame(current_flags)
+        else:
+            path = ctx.tables_dir / f"qc_flags_module{module_number:02d}.csv"
+            if not path.exists():
+                add_assessment(rows, f"Module {module_number:02d}", "QC file", "missing", "QC file must exist", "FAIL", "Module output QC is absent")
+                continue
+            qc = pd.read_csv(path)
+        if qc.empty:
+            add_assessment(rows, f"Module {module_number:02d}", "QC file", "missing", "QC file must exist", "FAIL", "Module output QC is absent")
+            continue
+        counts = qc["severity"].astype(str).str.upper().value_counts().to_dict()
+        if counts.get("HARD_FAIL", 0) > 0:
+            decision = "FAIL"
+        elif counts.get("SOFT_FAIL", 0) > 0 or counts.get("WARN", 0) > 0:
+            decision = "PASS_WITH_WARN"
+        else:
+            decision = "PASS"
+        add_assessment(rows, f"Module {module_number:02d}", "QC severity counts", str(counts), "HARD_FAIL must be 0", decision, "Module-level QC gate")
+
+    if base_qc is not None and not base_qc.empty:
+        negative_hours = int(base_qc["negative_hours"].sum()) if "negative_hours" in base_qc.columns else 0
+        min_base = float(base_qc["min_base_residual_mw"].min()) if "min_base_residual_mw" in base_qc.columns else np.nan
+        add_assessment(
+            rows,
+            "Module 04",
+            "base residual negative hours",
+            negative_hours,
+            "0 preferred; negatives require diagnosis",
+            "PASS" if negative_hours == 0 else "PASS_WITH_WARN",
+            f"Minimum raw base residual MW = {compact_value(min_base)}",
+        )
+    if template is not None and not template.empty and "base_template_share" in template.columns:
+        sums = template.groupby("province_cn")["base_template_share"].sum()
+        max_dev = float((sums - 1.0).abs().max())
+        add_assessment(
+            rows,
+            "Module 04",
+            "8760 template share closure",
+            max_dev,
+            "absolute deviation <= 1e-9",
+            "PASS" if max_dev <= 1e-9 else "FAIL",
+            "Mean base residual template must close to one by province",
+        )
+
+    if actual is not None and not actual.empty:
+        focus = actual[actual["model_col"].eq("spring_adjusted_total_load_mw")].copy()
+        for _, row in focus.iterrows():
+            province = row["province_cn"]
+            coverage = float(row["coverage"])
+            corr = float(row["corr"])
+            mape = float(row["MAPE"])
+            peak_error_pct = np.nan
+            if actual_peak is not None and not actual_peak.empty:
+                peak = actual_peak[
+                    actual_peak["province_cn"].eq(province)
+                    & actual_peak["model_col"].eq("spring_adjusted_total_load_mw")
+                ]
+                if not peak.empty:
+                    peak_error_pct = float(peak.iloc[0]["peak_load_error_pct"])
+            monthly_max_abs = np.nan
+            if actual_monthly is not None and not actual_monthly.empty:
+                monthly = actual_monthly[
+                    actual_monthly["province_cn"].eq(province)
+                    & actual_monthly["model_col"].eq("spring_adjusted_total_load_mw")
+                ].copy()
+                if not monthly.empty:
+                    monthly_max_abs = float(monthly["monthly_energy_error_pct"].abs().max())
+            shape_min = np.nan
+            if actual_shape is not None and not actual_shape.empty:
+                shape = actual_shape[
+                    actual_shape["province_cn"].eq(province)
+                    & actual_shape["model_col"].eq("spring_adjusted_total_load_mw")
+                ]
+                if not shape.empty:
+                    shape_min = float(shape["hourly_shape_corr_by_month"].min())
+
+            add_assessment(rows, f"Module 05 {province}", "actual coverage", coverage, ">= 0.98", "PASS" if coverage >= 0.98 else "PASS_WITH_WARN", "Actual dispatch-load validation coverage")
+            add_assessment(rows, f"Module 05 {province}", "overall MAPE pct", mape, "<= 10 good; 10-20 warning; >20 fail", "PASS" if mape <= 10 else ("PASS_WITH_WARN" if mape <= 20 else "FAIL"), "Energy/load magnitude error against actual dispatch load")
+            add_assessment(rows, f"Module 05 {province}", "overall correlation", corr, ">= 0.8", "PASS" if corr >= 0.8 else "PASS_WITH_WARN", "Hourly shape agreement")
+            add_assessment(rows, f"Module 05 {province}", "peak load error pct", peak_error_pct, "absolute <= 5", "PASS" if pd.notna(peak_error_pct) and abs(peak_error_pct) <= 5 else "PASS_WITH_WARN", "Peak magnitude validation")
+            add_assessment(rows, f"Module 05 {province}", "worst monthly energy error pct", monthly_max_abs, "<= 10 preferred; >20 high", "PASS" if pd.notna(monthly_max_abs) and monthly_max_abs <= 10 else ("PASS_WITH_WARN" if pd.notna(monthly_max_abs) and monthly_max_abs <= 30 else "FAIL"), "Worst month highlights口径/春节/actual coverage risk")
+            add_assessment(rows, f"Module 05 {province}", "minimum monthly shape corr", shape_min, ">= 0.5 preferred", "PASS" if pd.notna(shape_min) and shape_min >= 0.5 else "PASS_WITH_WARN", "Worst monthly hourly-shape correlation")
+
+    assessment = pd.DataFrame(rows)
+    write_df(assessment, ctx.tables_dir / "module_error_assessment.csv")
+    report = "# Module Error Assessment\n\n"
+    report += "This report summarizes QC gates and validation errors. Guangdong and Hainan actual dispatch loads remain validation-only and are not used for national calibration.\n\n"
+    report += markdown_table(assessment)
+    report += "\n"
+    write_markdown(ctx.reports_dir / "05_module_error_assessment_report.md", report)
+
+
 def main() -> None:
     args = parse_args("Module 06: figures and reports")
     ctx = init_context(args, MODULE)
     flags: list[dict] = []
+    configure_matplotlib_fonts(flags)
     try:
         components = read_required_table(ctx, "hourly_province_load_components_2020_2024.csv.gz", compression="gzip")
         summary = read_required_table(ctx, "component_energy_summary_by_province_year.csv")
@@ -61,6 +238,9 @@ def main() -> None:
         base_qc = load_optional(ctx, "base_residual_qc.csv")
         template = load_optional(ctx, "base_template_8760_mean_2020_2024.csv.gz")
         actual = load_optional(ctx, "actual_load_comparison_guangdong_hainan.csv")
+        actual_monthly = load_optional(ctx, "actual_load_monthly_comparison_guangdong_hainan.csv")
+        actual_shape = load_optional(ctx, "actual_load_shape_corr_by_month_guangdong_hainan.csv")
+        actual_peak = load_optional(ctx, "actual_load_peak_comparison_guangdong_hainan.csv")
         spring_actual = load_optional(ctx, "actual_comparison_after_spring_adjustment.csv")
 
         flow = pd.DataFrame(
@@ -194,7 +374,9 @@ def main() -> None:
         write_markdown(ctx.reports_dir / "02_quality_control_report.md", report2)
         write_markdown(ctx.reports_dir / "03_actual_load_validation_report.md", report3)
         write_markdown(ctx.reports_dir / "04_future_template_description.md", report4)
+        add_qc(flags, MODULE, "INFO", "error_assessment_written", "Module-level error assessment report written", blocking=False)
         add_qc(flags, MODULE, "INFO", "figures_reports_written", "模块 06 图件与报告输出完成", blocking=False)
+        write_error_assessment(ctx, flags, actual, actual_monthly, actual_shape, actual_peak, base_qc, template)
     except FileNotFoundError as exc:
         add_qc(flags, MODULE, "SOFT_FAIL", "upstream_missing", "模块 06 缺少上游结果，阻断图件和报告生成", repr(exc), blocking=True)
     except Exception as exc:

@@ -107,6 +107,25 @@ Result: `syntax ok 9`.
   `configured_workers=4`, `active_workers=4`, 60 monthly temporary weather
   files, `weather_rows=1,359,288`, and `thermal_rows=1,359,288`. The final QC
   has 5 `INFO`, 1 configured 2019-boundary fallback `WARN`, and 0 `HARD_FAIL`.
+- Modules 03-06 have now completed on the same run directory,
+  `outputs/run_20260617_122125`. Old intermediate `outputs/run_*` directories
+  were deleted locally; this is the only retained run directory.
+- Module 03 EV load split completed with 0 `HARD_FAIL`; the only `WARN` is a
+  floating-point normalization of the 96-point EV probability profile. The 2024
+  EV stock is extrapolated for all 31 provinces using 2021-2023 CAGR.
+- Module 04 completed with hourly component closure max error
+  `2.91e-11 MW`, no negative raw base-residual hours, and 8760 template
+  province-share closure within `4.4e-13`.
+- Module 05 validation remains validation-only. Guangdong/Hainan peak errors
+  for `spring_adjusted_total_load_mw` are about 4.15%/4.05%, and correlations
+  are about 0.865/0.851. Overall MAPE remains warning-level
+  (12.65%/17.22%), and worst-month energy errors are high
+  (82.44%/57.33%); these validation errors must not be used to recalibrate the
+  national load anchor.
+- Module 06 now configures an explicit CJK-capable figure font (`SimHei`) and
+  writes `module_error_assessment.csv` plus
+  `05_module_error_assessment_report.md`. Figure outputs have 15 matched
+  PNG/PDF/plot-data CSV triplets.
 
 ## Review Priorities
 
@@ -128,6 +147,9 @@ spring_adjusted_total_load_mw
 
 - Whether validation-only actual loads for Guangdong and Hainan are kept out of
   calibration paths.
+- Whether the high worst-month Guangdong/Hainan validation errors should be
+  described as source口径/actual-coverage limitations or require additional
+  validation-data cleaning before publication.
 
 ## Excluded From Repository
 
